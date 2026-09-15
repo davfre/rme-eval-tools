@@ -1,0 +1,10 @@
+# built tools
+/ratesweep
+/ratecheck
+/ratesteal
+
+# mixer snapshots written by reload-driver.sh
+/state/
+
+__pycache__/
+*.pyc
