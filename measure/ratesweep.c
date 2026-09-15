@@ -46,6 +46,8 @@
 //   bank3     hunt for whatever could halve the clock, for 32 kHz
 //   pitch     varispeed at each base - does +5 %% really mean +5 %% at all
 //             four bases, on the wire?
+//   rearm     repeated sessions with and without the 0x13 disarm, to test
+//             whether issue #5's silent restart is a missing disarm
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -204,6 +206,11 @@ static void report(const char *label, int want_hz, double bps, int alt,
 static unsigned int g_bank3 = 0x7CFF;
 /* Varispeed, in 0.1 % steps, exactly as the driver's control takes it. */
 static int g_pitch;
+/* Send the 0x13 session disarm when tearing a session down?  The driver's
+ * babyface_stream_kill() does not: it kills the URBs and clears a flag, and
+ * 0x13 is never sent at all.  Every probe in tools/usbdump does send it.
+ * Setting this to 0 reproduces what the driver does. */
+static int g_disarm = 1;
 
 static void dds_write(int base_hz)
 {
@@ -287,7 +294,8 @@ static void disarm(void)
 {
 	int i;
 
-	ctl(0x13, 0x0000, 0xC000);
+	if (g_disarm)
+		ctl(0x13, 0x0000, 0xC000);
 	for (i = 0; i < NQ; i++) {
 		ioctl(fd, USBDEVFS_DISCARDURB, outs[i]);
 		ioctl(fd, USBDEVFS_DISCARDURB, ins[i]);
@@ -475,6 +483,33 @@ static void mode_pitch(void)
 		}
 	}
 	g_pitch = save;
+}
+
+/* Arm the same session repeatedly, with and without the 0x13 disarm in
+ * between.  Issue #5 reports that a runtime buffer change - which makes the
+ * driver stop and restart the session - leaves the stream "started" but
+ * silent until the module is reloaded.  The driver never sends 0x13.  If the
+ * firmware needs the old session closed before it will honour a new arm, the
+ * no-disarm column here goes quiet after the first row and the disarm column
+ * does not. */
+static void mode_rearm(void)
+{
+	int pass, i;
+
+	puts("\n== rearm: repeated sessions, with and without the 0x13 disarm ==");
+	for (pass = 0; pass < 2; pass++) {
+		g_disarm = pass == 0;
+		printf("\n  disarm between sessions: %s\n",
+		       g_disarm ? "yes (what the probes do)"
+				: "NO  (what the driver does)");
+		for (i = 0; i < 4; i++) {
+			char l[64];
+
+			snprintf(l, sizeof(l), "session %d", i + 1);
+			trial2(l, 48000, -1, 0x0030, 0, 1, 0, 48000);
+		}
+	}
+	g_disarm = 1;
 }
 
 /* The whole rate table under the measured model:
@@ -718,11 +753,12 @@ int main(int argc, char **argv)
 	else if (!strcmp(mode, "table"))    mode_table();
 	else if (!strcmp(mode, "bank3"))    mode_bank3();
 	else if (!strcmp(mode, "pitch"))    mode_pitch();
+	else if (!strcmp(mode, "rearm"))    mode_rearm();
 	else if (!strcmp(mode, "idx"))      mode_idx();
 	else {
 		fprintf(stderr, "unknown mode: %s\n"
 			"modes: sweep alts order clobber scanbase idx dds "
-			"ddsscan combo table bank3 pitch\n", mode);
+			"ddsscan combo table bank3 pitch rearm\n", mode);
 		return 1;
 	}
 
