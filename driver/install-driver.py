@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 
 MODULE = 'snd-usb-babyface-pro'
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 REPO = ROOT / 'babyface-pro-linux'
 OPTIONS = Path('/etc/modprobe.d/snd-usb-babyface-pro-local.conf')
 OPTION_TEXT = f'options {MODULE} frames_per_urb=32 nurbs=8\n'
