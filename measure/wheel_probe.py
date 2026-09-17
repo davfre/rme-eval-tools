@@ -90,7 +90,8 @@ class Card:
         for line in out.splitlines():
             line = line.strip()
             if line.startswith(": values="):
-                return [int(v) for v in line.split("=", 1)[1].split(",")]
+                return [1 if v == "on" else 0 if v == "off" else int(v)
+                        for v in line.split("=", 1)[1].split(",")]
         raise RuntimeError("no values for " + ident)
 
     def counters(self):
