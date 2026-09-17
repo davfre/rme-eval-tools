@@ -1,7 +1,6 @@
 # rme-eval-tools
 
-Local tooling for the Babyface Pro driver work. Outside both upstream
-repositories on purpose: none of it is part of a patch.
+Local tooling for the Babyface Pro driver work. Outside babyface-pro-linux and TuxMix repositories on purpose: none of it is part of a patch.
 
     make            # builds the three measurement tools into this directory
 
@@ -44,7 +43,7 @@ clock, and run the models alternately rather than back to back.
 
 ## driver/
 
-Build, install and reload helpers, driven from the `justfile` one level up:
+This is local tooling to build, install and reload helpers, and may not be useful on another maching depending on setup. It's driven from the `justfile` one level up:
 
     just driver-build          # build for the running kernel
     just driver-load-local     # build, reload temporarily, leave outputs muted
