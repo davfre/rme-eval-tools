@@ -76,6 +76,9 @@ FADER_0DB = 0x16a0
 MASTER_START = 0x0333     # -20 dB, room to turn both ways
 PARAM = "/sys/module/snd_usb_babyface_pro/parameters/wheel_mode"
 
+# Tone level for run(); the trace runs lower it for headroom up to +6 dB.
+RUN_TONE_DBFS = [None]
+
 STEP_THR = 0.003          # residual / amplitude: about 0.05 dB
 GLITCH_THR = 0.3          # far beyond a 0.5 dB step (~0.06-0.12)
 
@@ -151,10 +154,10 @@ def start_master(card, target):
               "%d,%d" % (MASTER_START, MASTER_START), index=out)
 
 
-def tone_second():
+def tone_second(dbfs=None):
     """One second of tone; 997 Hz is exactly 997 cycles per second at
     48 kHz, so the block repeats without a seam."""
-    amp = (10 ** (TONE_DBFS / 20)) * 0x7fffff
+    amp = (10 ** ((TONE_DBFS if dbfs is None else dbfs) / 20)) * 0x7fffff
     w = 2 * math.pi * FREQ / RATE
     out = bytearray(RATE * CH * 4)
     for f in range(RATE):
@@ -165,14 +168,14 @@ def tone_second():
     return bytes(out)
 
 
-def run(card, dev, seconds, path, go=None):
+def run(card, dev, seconds, path, go=None, before_rec=None):
     """Play the tone and record `seconds` of all capture channels.
     `go` is called 1.5 s into the recording, after the start level."""
     play = subprocess.Popen(["aplay", "-q", "-D", dev, "-t", "raw",
                              "-f", "S32_LE", "-c", str(CH), "-r", str(RATE)],
                             stdin=subprocess.PIPE)
     stop = threading.Event()
-    block = tone_second()
+    block = tone_second(RUN_TONE_DBFS[0])
 
     def feed():
         try:
@@ -184,6 +187,8 @@ def run(card, dev, seconds, path, go=None):
     t = threading.Thread(target=feed, daemon=True)
     t.start()
     time.sleep(0.8)
+    if before_rec:
+        before_rec()
     rec = subprocess.Popen(["arecord", "-q", "-D", dev, "-t", "raw",
                             "-f", "S32_LE", "-c", str(CH), "-r", str(RATE),
                             "-d", str(seconds), path])
@@ -332,6 +337,94 @@ def wheel_counts(lines):
             else:
                 down -= d
     return up, down, polls
+
+
+def kmsg_events(lines, tag):
+    """(timestamp, delta) for each wheel count change after the marker,
+    and the marker's own timestamp."""
+    import re
+    ts_re = re.compile(r"^\[\s*([0-9.]+)\]")
+    t0 = None
+    events = []
+
+    def cls(b):
+        return 1 if b >> 4 in (8, 9) else 0 if b >> 4 == 0 else 2
+    for line in lines:
+        m = ts_re.match(line)
+        if not m:
+            continue
+        t = float(m.group(1))
+        if "wheel_probe %s" % tag in line:
+            t0 = t
+            events = []
+            continue
+        if t0 is None or " panel " not in line or "->" not in line:
+            continue
+        try:
+            a, b = line.split(" panel ", 1)[1].split("->")
+            p = [int(v, 16) for v in a.split()]
+            q = [int(v, 16) for v in b.split()]
+        except ValueError:
+            continue
+        d = (q[2] & 15) - (p[2] & 15)
+        if d > 8:
+            d -= 16
+        elif d < -8:
+            d += 16
+        if d and cls(q[2]) == cls(p[2]):
+            events.append((round(t - t0, 4), d))
+    return t0, events
+
+
+def run_trace(card, dev, target, seconds, outdir, repeats):
+    import json
+    set_mode(5)
+    subprocess.run(["sudo", "tee", PANEL_DEBUG], input="1", text=True,
+                   stdout=subprocess.DEVNULL, check=True)
+    RUN_TONE_DBFS[0] = TRACE_TONE_DBFS
+    runs = [k for _ in range(repeats) for k in TRACE_KINDS]
+    meta = []
+    try:
+        for n, (label, start_db, what) in enumerate(runs):
+            out = target["out"]
+            force_master(card, out, master_for_db(start_db))
+            time.sleep(0.3)
+            print("\n-- %d/%d %s\n   %s, then stop." % (n + 1, len(runs),
+                                                     label, what))
+            input("   Press Enter, hands off, and wait for GO. ")
+            tag = "trace%d-%d" % (os.getpid(), n)
+            raw = os.path.join(outdir, "trace-%02d.raw" % n)
+            run(card, dev, seconds, raw,
+                go=lambda: print("   >>> GO <<<", flush=True),
+                before_rec=lambda: kmsg_mark(tag))
+            out_lines = subprocess.run(["sudo", "dmesg"], capture_output=True,
+                                       text=True, check=True).stdout
+            t0, events = kmsg_events(out_lines.splitlines(), tag)
+            x = max(load(raw, target["rec"]),
+                    key=lambda ch: max(abs(v) for v in ch))
+            os.remove(raw)
+            wav = os.path.join(outdir, "trace-%02d.wav" % n)
+            save_wav(wav, x, x)
+            db0, db1 = settled_db(x, True), settled_db(x, False)
+            net = sum(d for _, d in events)
+            clip = max(abs(v) for v in x) > 0.95
+            print("   counts %+d in %d polls, level %.1f -> %.1f dB%s" %
+                  (net, len(events), db0, db1,
+                   "  (CLIPPED)" if clip else ""))
+            meta.append({"n": n, "label": label, "start_db": start_db,
+                         "master": master_for_db(start_db),
+                         "wav": os.path.basename(wav), "marker_found":
+                         t0 is not None, "events": events,
+                         "level_start": db0, "level_end": db1,
+                         "clipped": clip})
+            with open(os.path.join(outdir, "trace.json"), "w") as f:
+                json.dump({"tone_dbfs": TRACE_TONE_DBFS, "rate": RATE,
+                           "go_s": 1.5, "runs": meta}, f, indent=1)
+    finally:
+        RUN_TONE_DBFS[0] = None
+        subprocess.run(["sudo", "tee", PANEL_DEBUG], input="0", text=True,
+                       stdout=subprocess.DEVNULL)
+    print("\nSaved %d traces and trace.json in %s" % (len(meta), outdir))
 
 
 def settled_db(x, first):
@@ -491,13 +584,36 @@ STEP_KINDS = [
      "spin ANTICLOCKWISE quickly, about 10 clicks in one flick"),
 ]
 PANEL_DEBUG = "/sys/module/snd_usb_babyface_pro/parameters/panel_debug"
+
+
+def master_for_db(db):
+    return int(round(0x2000 * 2 ** (db / 6)))
+
+
+# (label, start dB, instruction).  Starts on both sides of -10 dB, where
+# the slow step seems to change from 1 dB to 0.5 dB.
+SLOW = "turn slowly, one click at a time with a short pause, about 12 clicks"
+STEADY = "turn steadily without pausing, about 2 clicks per second, 12 clicks"
+FAST = "spin quickly, about 12 clicks in one flick"
+TRACE_KINDS = [
+    ("slow up from -40", -40, "CLOCKWISE: " + SLOW),
+    ("slow up from -14", -14, "CLOCKWISE: " + SLOW),
+    ("slow down from +4", 4, "ANTICLOCKWISE: " + SLOW),
+    ("slow down from -12", -12, "ANTICLOCKWISE: " + SLOW),
+    ("steady up from -40", -40, "CLOCKWISE: " + STEADY),
+    ("steady down from +4", 4, "ANTICLOCKWISE: " + STEADY),
+    ("fast up from -40", -40, "CLOCKWISE: " + FAST),
+    ("fast down from +4", 4, "ANTICLOCKWISE: " + FAST),
+]
+TRACE_TONE_DBFS = -24.0
 RUNS = RUNS_OPTICAL
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
-    ap.add_argument("--runs", choices=("default", "device", "fix", "steps"),
+    ap.add_argument("--runs",
+                    choices=("default", "device", "fix", "steps", "trace"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--repeats", type=int, default=2,
@@ -551,7 +667,10 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        if args.runs == "steps":
+        if args.runs == "trace":
+            run_trace(card, dev, target, args.seconds, outdir, args.repeats)
+            runs = []
+        elif args.runs == "steps":
             run_steps(card, dev, target, args.seconds, outdir,
                       args.repeats)
             runs = []
