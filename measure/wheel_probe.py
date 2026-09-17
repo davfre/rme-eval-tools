@@ -386,7 +386,7 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
             "balance" if balance else "trace")
     kinds = (CHECK_KINDS if check else FLOOR_KINDS if floor else
              BALANCE_KINDS if balance else TRACE_KINDS)
-    balance = balance or floor
+    balance = balance or floor or check
     set_mode(1 if check else 5)
     sides = recorded_sides(card, dev, target, outdir) if balance else {}
     side = min(sides) if sides else 0
@@ -457,27 +457,37 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
             if check:
                 raw16 = card.cget(OUTPUTS[out] + " Playback Volume",
                                   index=out)
-                cache_db = [6 * math.log2(v / 0x2000) if v else -180.0
-                            for v in raw16]
-                device_db = start_db + (db1 - db0)
-                # The resync write comes 150 ms after the last click;
-                # measure the device's own level just before it.
-                pre_db = None
-                if events:
-                    a = int((events[-1][0] + 0.04) * RATE)
-                    if a + int(0.08 * RATE) <= len(x):
-                        pre_db = start_db + (tone_db(
-                            x[a:a + int(0.08 * RATE)]) - db0)
-                pre = pre_db if pre_db is not None else device_db
-                print("   device %.1f dB before the resync, %.1f after; "
-                      "driver cache %s  %s" %
-                      (pre, device_db,
-                       "/".join("%.1f" % c for c in cache_db),
-                       "OK" if abs(cache_db[0] - pre) < 0.25
-                       else "MISMATCH (resync moved it %+.1f dB)"
-                       % (device_db - pre)))
-                entry = {"cache_raw": raw16, "cache_db": cache_db,
-                         "device_db": device_db, "pre_resync_db": pre_db}
+                chans = by_side if pair else {0: x}
+                ref = pair if pair else (start_db, start_db)
+                entry.update({"cache_raw": raw16, "pre_resync_db": [],
+                              "device_db": []})
+                for sd, xs in sorted(chans.items()):
+                    d0 = settled_db(xs, True)
+                    dev_db = ref[sd] + settled_db(xs, False) - d0
+                    # The resync write comes 150 ms after the last
+                    # click; measure the device's own level before it.
+                    pre = dev_db
+                    if events:
+                        a = int((events[-1][0] + 0.04) * RATE)
+                        if a + int(0.08 * RATE) <= len(xs):
+                            pre = ref[sd] + tone_db(
+                                xs[a:a + int(0.08 * RATE)]) - d0
+                    v = raw16[sd]
+                    cache = 6 * math.log2(v / 0x2000) if v else None
+                    if pre < -90 or cache is None:
+                        ok = pre < -85 and (cache is None or cache < -60)
+                    elif pre < -64:
+                        ok = cache is not None and cache < -60
+                    else:
+                        ok = abs(v - master_for_db(pre)) <= 1 or \
+                            abs(cache - pre) < 0.25
+                    print("   %s: device %.1f dB before the resync, %.1f "
+                          "after; driver cache %s  %s" %
+                          (("left", "right")[sd], pre, dev_db,
+                           "silent" if cache is None else "%.1f" % cache,
+                           "OK" if ok else "MISMATCH"))
+                    entry["pre_resync_db"].append(pre)
+                    entry["device_db"].append(dev_db)
             if pair:
                 entry["start_lr"] = pair
                 entry["sides"] = {str(k): v for k, v in sides.items()}
@@ -734,6 +744,12 @@ CHECK_KINDS = [
     ("check fast down from +4", 4, "ANTICLOCKWISE: " + FAST),
     ("check mixed up from -30", -30, "CLOCKWISE: " + MIXED),
     ("check mixed down from 0", 0, "ANTICLOCKWISE: " + MIXED),
+    ("check balance fast up L-44 R-30", (-44, -30), "CLOCKWISE: " + FAST),
+    ("check balance slow down L-10 R-24", (-10, -24),
+     "ANTICLOCKWISE: " + SLOW),
+    ("check down to silence from -40", (-40, -40),
+     "ANTICLOCKWISE, one click at a time with a short pause, about 20 "
+     "clicks", {"tone_dbfs": -6.0, "seconds": 20}),
 ]
 # balance: the two sides of the output set apart, driver silent.  Each
 # pair (L dB, R dB) runs twice with the sides swapped, so the recorded
