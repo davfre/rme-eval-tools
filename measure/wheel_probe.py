@@ -377,16 +377,17 @@ def kmsg_events(lines, tag):
 
 
 def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
-              balance=False, floor=False):
+              balance=False, floor=False, mutebal=False):
     """Record turns with the driver silent (trace) or, with check, in
     wheel_mode 1, and compare the driver's cached level with the level
     the device ends at."""
     import json
     name = ("check" if check else "floor" if floor else
-            "balance" if balance else "trace")
+            "mutebal" if mutebal else "balance" if balance else "trace")
     kinds = (CHECK_KINDS if check else FLOOR_KINDS if floor else
+             MUTEBAL_KINDS if mutebal else
              BALANCE_KINDS if balance else TRACE_KINDS)
-    balance = balance or floor or check
+    balance = balance or floor or check or mutebal
     set_mode(1 if check else 5)
     sides = recorded_sides(card, dev, target, outdir) if balance else {}
     side = min(sides) if sides else 0
@@ -781,6 +782,17 @@ FLOOR_KINDS = [
      "CLOCKWISE one click at a time with a short pause, about 15 clicks",
      FLOOR),
 ]
+# mutebal: the quieter side mutes while the louder one still plays, then
+# back up: does the device keep the balance?
+MUTEBAL_WHAT = ("ANTICLOCKWISE, one click at a time with a short pause, 16 "
+                "clicks. Pause 2 s. Then CLOCKWISE the same way, 12 clicks")
+MUTEBAL_OPTS = {"tone_dbfs": -6.0, "seconds": 30}
+MUTEBAL_KINDS = [
+    ("mutebal slow down L-40 R-62, then up", (-40, -62), MUTEBAL_WHAT,
+     MUTEBAL_OPTS),
+    ("mutebal slow down L-62 R-40, then up", (-62, -40), MUTEBAL_WHAT,
+     MUTEBAL_OPTS),
+]
 TRACE_TONE_DBFS = -24.0
 RUNS = RUNS_OPTICAL
 
@@ -790,7 +802,7 @@ def main():
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
     ap.add_argument("--runs",
                     choices=("default", "device", "fix", "steps", "trace",
-                             "check", "balance", "floor"),
+                             "check", "balance", "floor", "mutebal"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--repeats", type=int, default=2,
@@ -844,11 +856,12 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        if args.runs in ("trace", "check", "balance", "floor"):
+        if args.runs in ("trace", "check", "balance", "floor", "mutebal"):
             run_trace(card, dev, target, args.seconds, outdir, args.repeats,
                       check=args.runs == "check",
                       balance=args.runs == "balance",
-                      floor=args.runs == "floor")
+                      floor=args.runs == "floor",
+                      mutebal=args.runs == "mutebal")
             runs = []
         elif args.runs == "steps":
             run_steps(card, dev, target, args.seconds, outdir,
