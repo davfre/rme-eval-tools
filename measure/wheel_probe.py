@@ -281,6 +281,96 @@ def analyse(x):
     }
 
 
+def kmsg_lines():
+    out = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True,
+                         check=True).stdout
+    return out.splitlines()
+
+
+def wheel_counts(lines):
+    """Sum the wheel counter deltas in "panel a b c d -> e f g h" lines,
+    the same way the driver does (low nibble of byte 2, 4-bit wrap, only
+    within one mode class)."""
+    def cls(b):
+        return 1 if b >> 4 in (8, 9) else 0 if b >> 4 == 0 else 2
+    up = down = 0
+    polls = []
+    for line in lines:
+        if " panel " not in line or "->" not in line:
+            continue
+        try:
+            a, b = line.split(" panel ", 1)[1].split("->")
+            p = [int(v, 16) for v in a.split()]
+            q = [int(v, 16) for v in b.split()]
+        except ValueError:
+            continue
+        d = (q[2] & 15) - (p[2] & 15)
+        if d > 8:
+            d -= 16
+        elif d < -8:
+            d += 16
+        if d and cls(q[2]) == cls(p[2]):
+            polls.append(d)
+            if d > 0:
+                up += d
+            else:
+                down -= d
+    return up, down, polls
+
+
+def settled_db(x, first):
+    """Tone level over the first or last 300 ms of the recording."""
+    n = int(0.3 * RATE)
+    seg = x[RATE // 3:RATE // 3 + n] if first else x[-n:]
+    c = math.cos(2 * math.pi * FREQ / RATE)
+    s0 = s1 = 0.0
+    for v in seg:
+        s0, s1 = v + 2 * c * s0 - s1, s0
+    power = s0 * s0 + s1 * s1 - 2 * c * s0 * s1
+    amp = 2 * math.sqrt(max(power, 0)) / len(seg)
+    return 20 * math.log10(amp) if amp > 0 else -180.0
+
+
+def run_steps(card, dev, target, seconds, outdir):
+    set_mode(5)
+    subprocess.run(["sudo", "tee", PANEL_DEBUG], input="1", text=True,
+                   stdout=subprocess.DEVNULL, check=True)
+    rows = []
+    try:
+        for label, start, what in STEP_RUNS:
+            out = target["out"]
+            card.cset(OUTPUTS[out] + " Playback Volume",
+                      "%d,%d" % (start, start), index=out)
+            print("\n-- %s\n   %s" % (label, what))
+            input("   Press Enter, then start within a second "
+                  "(%d s recording). " % seconds)
+            before = len(kmsg_lines())
+            raw = os.path.join(outdir, "steps-%d.raw" % len(rows))
+            run(card, dev, seconds, raw)
+            up, down, polls = wheel_counts(kmsg_lines()[before:])
+            x = max(load(raw, target["rec"]),
+                    key=lambda ch: max(abs(v) for v in ch))
+            os.remove(raw)
+            db0, db1 = settled_db(x, True), settled_db(x, False)
+            net = up - down
+            per = (db1 - db0) / net if net else float("nan")
+            clip = max(abs(v) for v in x) > 0.95
+            print("   counts +%d -%d (per poll: %s)" %
+                  (up, down, " ".join("%+d" % d for d in polls[:40])))
+            print("   level %.1f -> %.1f dB: %+.1f dB, %.2f dB per count%s" %
+                  (db0, db1, db1 - db0, per,
+                   "  (CLIPPED, ignore)" if clip else ""))
+            rows.append((label, net, db1 - db0, per, max(map(abs, polls),
+                                                         default=0)))
+    finally:
+        subprocess.run(["sudo", "tee", PANEL_DEBUG], input="0", text=True,
+                       stdout=subprocess.DEVNULL)
+    print("\n== step size per count")
+    for label, net, ddb, per, big in rows:
+        print("  %-14s counts %+3d  level %+6.1f dB  %.2f dB/count  "
+              "largest count per poll %d" % (label, net, ddb, per, big))
+
+
 def median(vals):
     vals = sorted(vals)
     return vals[len(vals) // 2] if vals else 0
@@ -353,13 +443,29 @@ RUNS_FIX = [
     ("mode 0 (old driver), turning", 0, TURN),
     ("mode 5 (driver silent), turning", 5, TURN),
 ]
+# How far the device moves per wheel count, slow and fast.  Driver
+# silent (mode 5); the panel log gives the counts, the recording the dB.
+# (label, start master, instruction)
+STEP_RUNS = [
+    ("slow, up", 0x0103,
+     "Turn CLOCKWISE slowly, one click at a time, about 12 clicks. Then stop."),
+    ("fast, up", 0x0103,
+     "Spin CLOCKWISE quickly, about 12 clicks in one flick. Then stop."),
+    ("slow, down", 0x1000,
+     "Turn ANTICLOCKWISE slowly, one click at a time, about 12 clicks. Then stop."),
+    ("fast, down", 0x1000,
+     "Spin ANTICLOCKWISE quickly, about 12 clicks in one flick. Then stop."),
+    ("very fast, up", 0x0103,
+     "Spin CLOCKWISE as fast as you can, a short flick. Then stop."),
+]
+PANEL_DEBUG = "/sys/module/snd_usb_babyface_pro/parameters/panel_debug"
 RUNS = RUNS_OPTICAL
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
-    ap.add_argument("--runs", choices=("default", "device", "fix"),
+    ap.add_argument("--runs", choices=("default", "device", "fix", "steps"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--card", default="BabyfacePro")
@@ -411,6 +517,9 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
+        if args.runs == "steps":
+            run_steps(card, dev, target, args.seconds, outdir)
+            runs = []
         for label, mode, what in runs:
             set_mode(mode)
             start_master(card, target)
@@ -427,7 +536,8 @@ def main():
             if target["rec"] and max(peaks[c] for c in target["rec"]) < -70:
                 print("   WARNING: no tone on ch %s - loopback or routing "
                       "not working, this run is not valid" % (target["rec"],))
-            left, right = load(raw, target["rec"])
+            left, right = sorted(load(raw, target["rec"]),
+                                 key=lambda ch: -max(abs(v) for v in ch))
             save_wav(raw[:-4] + ".wav", left, right)
             os.remove(raw)
             results.append(report(label, analyse(left), before, after))
