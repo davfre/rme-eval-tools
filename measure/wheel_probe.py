@@ -376,14 +376,18 @@ def kmsg_events(lines, tag):
     return t0, events
 
 
-def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
+def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
+              balance=False):
     """Record turns with the driver silent (trace) or, with check, in
     wheel_mode 1, and compare the driver's cached level with the level
     the device ends at."""
     import json
-    name = "check" if check else "trace"
-    kinds = CHECK_KINDS if check else TRACE_KINDS
+    name = "check" if check else "balance" if balance else "trace"
+    kinds = (CHECK_KINDS if check else
+             BALANCE_KINDS if balance else TRACE_KINDS)
     set_mode(1 if check else 5)
+    sides = recorded_sides(card, dev, target, outdir) if balance else {}
+    side = min(sides) if sides else 0
     subprocess.run(["sudo", "tee", PANEL_DEBUG], input="1", text=True,
                    stdout=subprocess.DEVNULL, check=True)
     RUN_TONE_DBFS[0] = TRACE_TONE_DBFS
@@ -392,7 +396,14 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
     try:
         for n, (label, start_db, what) in enumerate(runs):
             out = target["out"]
-            force_master(card, out, master_for_db(start_db))
+            if isinstance(start_db, tuple):
+                pair = start_db
+                start_db = pair[side]
+                force_master(card, out, tuple(master_for_db(d)
+                                              for d in pair))
+            else:
+                pair = None
+                force_master(card, out, master_for_db(start_db))
             time.sleep(0.3)
             print("\n-- %d/%d %s\n   %s, then stop." % (n + 1, len(runs),
                                                      label, what))
@@ -405,11 +416,22 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
             out_lines = subprocess.run(["sudo", "dmesg"], capture_output=True,
                                        text=True, check=True).stdout
             t0, events = kmsg_events(out_lines.splitlines(), tag)
-            x = max(load(raw, target["rec"]),
-                    key=lambda ch: max(abs(v) for v in ch))
+            if pair:
+                # Both sides when split; the wav is L/R (a missing side
+                # repeats the other).
+                chans = load(raw, SPLIT_CH)
+                by_side = {sd: chans[SPLIT_CH.index(ch)]
+                           for sd, ch in sides.items()}
+                x = by_side[side]
+                other = by_side.get(1 - side, x)
+                lr = (x, other) if side == 0 else (other, x)
+            else:
+                x = max(load(raw, target["rec"]),
+                        key=lambda ch: max(abs(v) for v in ch))
+                lr = (x, x)
             os.remove(raw)
             wav = os.path.join(outdir, "%s-%02d.wav" % (name, n))
-            save_wav(wav, x, x)
+            save_wav(wav, *lr)
             db0, db1 = settled_db(x, True), settled_db(x, False)
             net = sum(d for _, d in events)
             clip = max(abs(v) for v in x) > 0.95
@@ -417,6 +439,15 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
                   (net, len(events), db0, db1,
                    "  (CLIPPED)" if clip else ""))
             entry = {}
+            if pair:
+                ends = {}
+                for sd, xs in sorted(by_side.items()):
+                    d0, d1 = settled_db(xs, True), settled_db(xs, False)
+                    ends[sd] = pair[sd] + d1 - d0
+                    print("   %s: %+.1f -> %+.1f dB (moved %+.1f)" %
+                          (("left", "right")[sd], pair[sd], ends[sd],
+                           ends[sd] - pair[sd]))
+                entry["end_lr"] = [ends.get(0), ends.get(1)]
             if check:
                 raw16 = card.cget(OUTPUTS[out] + " Playback Volume",
                                   index=out)
@@ -441,8 +472,13 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
                        % (device_db - pre)))
                 entry = {"cache_raw": raw16, "cache_db": cache_db,
                          "device_db": device_db, "pre_resync_db": pre_db}
+            if pair:
+                entry["start_lr"] = pair
+                entry["sides"] = {str(k): v for k, v in sides.items()}
+                entry["wav_channels"] = "left, right"
             meta.append({"n": n, "label": label, "start_db": start_db,
                          "master": master_for_db(start_db),
+                         "tone_dbfs": TRACE_TONE_DBFS,
                          "wav": os.path.basename(wav), "marker_found":
                          t0 is not None, "events": events,
                          "level_start": db0, "level_end": db1,
@@ -477,10 +513,50 @@ def tone_db(seg):
 
 def force_master(card, out, value):
     """Set the master even when the driver's cache already holds it (the
-    driver skips a write of an unchanged value)."""
+    driver skips a write of an unchanged value).  `value` is one raw
+    value for both sides or an (L, R) pair."""
     name = OUTPUTS[out] + " Playback Volume"
-    card.cset(name, "%d,%d" % (value + 1, value + 1), index=out)
-    card.cset(name, "%d,%d" % (value, value), index=out)
+    l, r = value if isinstance(value, tuple) else (value, value)
+    card.cset(name, "%d,%d" % (l + 1, r + 1), index=out)
+    card.cset(name, "%d,%d" % (l, r), index=out)
+
+
+# IN3 and IN4: a stereo-to-mono split cable puts one side on each.
+SPLIT_CH = (2, 3)
+
+
+def recorded_sides(card, dev, target, outdir):
+    """Which side of the output each of IN3/IN4 carries, as
+    {side: channel}, side 0 left, 1 right.  With a single mono cable
+    only one side is found."""
+    out = target["out"]
+    levels = []
+    for side in (0, 1):
+        loud = master_for_db(-10)
+        quiet = master_for_db(-50)
+        force_master(card, out, (loud, quiet) if side == 0
+                     else (quiet, loud))
+        time.sleep(0.3)
+        raw = os.path.join(outdir, "side%d.raw" % side)
+        run(card, dev, 2, raw)
+        levels.append([tone_db(x[RATE // 2:])
+                       for x in load(raw, SPLIT_CH)])
+        os.remove(raw)
+    sides = {}
+    for i, ch in enumerate(SPLIT_CH):
+        diff = levels[0][i] - levels[1][i]
+        name = "-"
+        if diff > 20:
+            sides[0] = ch
+            name = "left"
+        elif diff < -20:
+            sides[1] = ch
+            name = "right"
+        print("   IN%d: %.1f dB with left loud, %.1f dB with right loud "
+              "-> %s" % (ch + 1, levels[0][i], levels[1][i], name))
+    if not sides:
+        raise RuntimeError("neither IN3 nor IN4 carries one side")
+    return sides
 
 
 def run_steps(card, dev, target, seconds, outdir, repeats):
@@ -653,6 +729,19 @@ CHECK_KINDS = [
     ("check mixed up from -30", -30, "CLOCKWISE: " + MIXED),
     ("check mixed down from 0", 0, "ANTICLOCKWISE: " + MIXED),
 ]
+# balance: the two sides of the output set apart, driver silent.  Each
+# pair (L dB, R dB) runs twice with the sides swapped, so the recorded
+# side is once the louder and once the quieter one.
+SLOW10 = ("turn slowly, one click at a time with a short pause, "
+          "about 10 clicks")
+BALANCE_KINDS = [
+    ("balance slow up L-20 R-32", (-20, -32), "CLOCKWISE: " + SLOW10),
+    ("balance slow up L-32 R-20", (-32, -20), "CLOCKWISE: " + SLOW10),
+    ("balance slow down L0 R-14", (0, -14), "ANTICLOCKWISE: " + SLOW10),
+    ("balance slow down L-14 R0", (-14, 0), "ANTICLOCKWISE: " + SLOW10),
+    ("balance fast up L-40 R-28", (-40, -28), "CLOCKWISE: " + FAST),
+    ("balance fast up L-28 R-40", (-28, -40), "CLOCKWISE: " + FAST),
+]
 TRACE_TONE_DBFS = -24.0
 RUNS = RUNS_OPTICAL
 
@@ -662,7 +751,7 @@ def main():
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
     ap.add_argument("--runs",
                     choices=("default", "device", "fix", "steps", "trace",
-                             "check"),
+                             "check", "balance"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--repeats", type=int, default=2,
@@ -716,9 +805,10 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        if args.runs in ("trace", "check"):
+        if args.runs in ("trace", "check", "balance"):
             run_trace(card, dev, target, args.seconds, outdir, args.repeats,
-                      check=args.runs == "check")
+                      check=args.runs == "check",
+                      balance=args.runs == "balance")
             runs = []
         elif args.runs == "steps":
             run_steps(card, dev, target, args.seconds, outdir,
