@@ -344,13 +344,22 @@ RUNS_DEVICE = [
     ("mode 5 (driver silent), turning", 5, TURN),
     ("mode 0 (direct), turning, for comparison", 0, TURN),
 ]
+# The fix (mode 1: 16-bit only, 1 dB per click) against the old driver
+# (mode 0) and the device alone (mode 5).
+RUNS_FIX = [
+    ("mode 1 (fix), five single clicks", 1,
+     "Turn the wheel ONE click, wait a second, repeat about five times."),
+    ("mode 1 (fix), turning", 1, TURN),
+    ("mode 0 (old driver), turning", 0, TURN),
+    ("mode 5 (driver silent), turning", 5, TURN),
+]
 RUNS = RUNS_OPTICAL
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
-    ap.add_argument("--runs", choices=("default", "device"),
+    ap.add_argument("--runs", choices=("default", "device", "fix"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--card", default="BabyfacePro")
@@ -362,6 +371,8 @@ def main():
     runs = RUNS_PHONES if args.target == "phones" else RUNS_OPTICAL
     if args.runs == "device":
         runs = RUNS_DEVICE
+    elif args.runs == "fix":
+        runs = RUNS_FIX
     dev = "hw:%s,0" % args.card
     outdir = args.out or tempfile.mkdtemp(prefix="wheel-probe-")
     os.makedirs(outdir, exist_ok=True)
