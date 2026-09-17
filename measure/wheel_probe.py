@@ -184,6 +184,19 @@ def run(card, dev, seconds, path):
     play.wait()
 
 
+def channel_peaks(path):
+    """Peak per capture channel in dBFS, after the first half second."""
+    with open(path, "rb") as f:
+        data = f.read()
+    frames = len(data) // (CH * 4)
+    vals = struct.unpack_from("<%di" % (frames * CH), data)
+    out = []
+    for c in range(CH):
+        p = max((abs(v) for v in vals[c::CH][RATE // 2:]), default=0)
+        out.append(20 * math.log10(p / 2 ** 31) if p else -180.0)
+    return out
+
+
 def load(path, chans):
     """The recording's channels `chans`; with None, the two capture
     channels carrying the most signal (the patched input)."""
@@ -366,6 +379,13 @@ def main():
     results = []
     try:
         setup(card, target)
+        out = target["out"]
+        print("   %s master %s, switch %s, loopback %s, PB6 fader %s" % (
+            OUTPUTS[out],
+            card.cget(OUTPUTS[out] + " Playback Volume", index=out),
+            card.cget(OUTPUTS[out] + " Playback Switch", index=out),
+            card.cget("Loopback Switch", index=out),
+            card.cget("PB6 Playback Volume", index=out * 14 + PB6_SRC)))
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
@@ -379,6 +399,12 @@ def main():
             raw = os.path.join(outdir, "run%d.raw" % len(results))
             run(card, dev, args.seconds, raw)
             after = card.counters()
+            peaks = channel_peaks(raw)
+            print("   capture peaks dBFS: " +
+                  " ".join("ch%d %.0f" % (c, p) for c, p in enumerate(peaks)))
+            if target["rec"] and max(peaks[c] for c in target["rec"]) < -70:
+                print("   WARNING: no tone on ch %s - loopback or routing "
+                      "not working, this run is not valid" % (target["rec"],))
             left, right = load(raw, target["rec"])
             save_wav(raw[:-4] + ".wav", left, right)
             os.remove(raw)
