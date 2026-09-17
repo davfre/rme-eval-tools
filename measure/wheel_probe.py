@@ -376,13 +376,18 @@ def kmsg_events(lines, tag):
     return t0, events
 
 
-def run_trace(card, dev, target, seconds, outdir, repeats):
+def run_trace(card, dev, target, seconds, outdir, repeats, check=False):
+    """Record turns with the driver silent (trace) or, with check, in
+    wheel_mode 1, and compare the driver's cached level with the level
+    the device ends at."""
     import json
-    set_mode(5)
+    name = "check" if check else "trace"
+    kinds = CHECK_KINDS if check else TRACE_KINDS
+    set_mode(1 if check else 5)
     subprocess.run(["sudo", "tee", PANEL_DEBUG], input="1", text=True,
                    stdout=subprocess.DEVNULL, check=True)
     RUN_TONE_DBFS[0] = TRACE_TONE_DBFS
-    runs = [k for _ in range(repeats) for k in TRACE_KINDS]
+    runs = [k for _ in range(repeats) for k in kinds]
     meta = []
     try:
         for n, (label, start_db, what) in enumerate(runs):
@@ -392,8 +397,8 @@ def run_trace(card, dev, target, seconds, outdir, repeats):
             print("\n-- %d/%d %s\n   %s, then stop." % (n + 1, len(runs),
                                                      label, what))
             input("   Press Enter, hands off, and wait for GO. ")
-            tag = "trace%d-%d" % (os.getpid(), n)
-            raw = os.path.join(outdir, "trace-%02d.raw" % n)
+            tag = "%s%d-%d" % (name, os.getpid(), n)
+            raw = os.path.join(outdir, "%s-%02d.raw" % (name, n))
             run(card, dev, seconds, raw,
                 go=lambda: print("   >>> GO <<<", flush=True),
                 before_rec=lambda: kmsg_mark(tag))
@@ -403,7 +408,7 @@ def run_trace(card, dev, target, seconds, outdir, repeats):
             x = max(load(raw, target["rec"]),
                     key=lambda ch: max(abs(v) for v in ch))
             os.remove(raw)
-            wav = os.path.join(outdir, "trace-%02d.wav" % n)
+            wav = os.path.join(outdir, "%s-%02d.wav" % (name, n))
             save_wav(wav, x, x)
             db0, db1 = settled_db(x, True), settled_db(x, False)
             net = sum(d for _, d in events)
@@ -411,25 +416,56 @@ def run_trace(card, dev, target, seconds, outdir, repeats):
             print("   counts %+d in %d polls, level %.1f -> %.1f dB%s" %
                   (net, len(events), db0, db1,
                    "  (CLIPPED)" if clip else ""))
+            entry = {}
+            if check:
+                raw16 = card.cget(OUTPUTS[out] + " Playback Volume",
+                                  index=out)
+                cache_db = [6 * math.log2(v / 0x2000) if v else -180.0
+                            for v in raw16]
+                device_db = start_db + (db1 - db0)
+                # The resync write comes 150 ms after the last click;
+                # measure the device's own level just before it.
+                pre_db = None
+                if events:
+                    a = int((events[-1][0] + 0.04) * RATE)
+                    if a + int(0.08 * RATE) <= len(x):
+                        pre_db = start_db + (tone_db(
+                            x[a:a + int(0.08 * RATE)]) - db0)
+                pre = pre_db if pre_db is not None else device_db
+                print("   device %.1f dB before the resync, %.1f after; "
+                      "driver cache %s  %s" %
+                      (pre, device_db,
+                       "/".join("%.1f" % c for c in cache_db),
+                       "OK" if abs(cache_db[0] - pre) < 0.25
+                       else "MISMATCH (resync moved it %+.1f dB)"
+                       % (device_db - pre)))
+                entry = {"cache_raw": raw16, "cache_db": cache_db,
+                         "device_db": device_db, "pre_resync_db": pre_db}
             meta.append({"n": n, "label": label, "start_db": start_db,
                          "master": master_for_db(start_db),
                          "wav": os.path.basename(wav), "marker_found":
                          t0 is not None, "events": events,
                          "level_start": db0, "level_end": db1,
-                         "clipped": clip})
-            with open(os.path.join(outdir, "trace.json"), "w") as f:
+                         "clipped": clip, **entry})
+            with open(os.path.join(outdir, name + ".json"), "w") as f:
                 json.dump({"tone_dbfs": TRACE_TONE_DBFS, "rate": RATE,
                            "go_s": 1.5, "runs": meta}, f, indent=1)
     finally:
         RUN_TONE_DBFS[0] = None
         subprocess.run(["sudo", "tee", PANEL_DEBUG], input="0", text=True,
                        stdout=subprocess.DEVNULL)
-    print("\nSaved %d traces and trace.json in %s" % (len(meta), outdir))
+    print("\nSaved %d recordings and %s.json in %s" % (len(meta), name,
+                                                       outdir))
 
 
 def settled_db(x, first):
     """Tone level before GO (0.5-1.3 s) or over the last 300 ms."""
     seg = x[RATE // 2:int(1.3 * RATE)] if first else x[-int(0.3 * RATE):]
+    return tone_db(seg)
+
+
+def tone_db(seg):
+    """Level of the tone in `seg`, dB of full scale."""
     c = math.cos(2 * math.pi * FREQ / RATE)
     s0 = s1 = 0.0
     for v in seg:
@@ -605,6 +641,18 @@ TRACE_KINDS = [
     ("fast up from -40", -40, "CLOCKWISE: " + FAST),
     ("fast down from +4", 4, "ANTICLOCKWISE: " + FAST),
 ]
+# check: the driver follows the wheel (wheel_mode 1).  Mixed speeds, so
+# the speed guess and the resync at rest both get exercised.
+MIXED = ("a few slow clicks, then a quick flick, then a few more slow "
+         "clicks, about 12 clicks in all")
+CHECK_KINDS = [
+    ("check slow up from -40", -40, "CLOCKWISE: " + SLOW),
+    ("check steady down from +4", 4, "ANTICLOCKWISE: " + STEADY),
+    ("check fast up from -40", -40, "CLOCKWISE: " + FAST),
+    ("check fast down from +4", 4, "ANTICLOCKWISE: " + FAST),
+    ("check mixed up from -30", -30, "CLOCKWISE: " + MIXED),
+    ("check mixed down from 0", 0, "ANTICLOCKWISE: " + MIXED),
+]
 TRACE_TONE_DBFS = -24.0
 RUNS = RUNS_OPTICAL
 
@@ -613,7 +661,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
     ap.add_argument("--runs",
-                    choices=("default", "device", "fix", "steps", "trace"),
+                    choices=("default", "device", "fix", "steps", "trace",
+                             "check"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--repeats", type=int, default=2,
@@ -667,8 +716,9 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        if args.runs == "trace":
-            run_trace(card, dev, target, args.seconds, outdir, args.repeats)
+        if args.runs in ("trace", "check"):
+            run_trace(card, dev, target, args.seconds, outdir, args.repeats,
+                      check=args.runs == "check")
             runs = []
         elif args.runs == "steps":
             run_steps(card, dev, target, args.seconds, outdir,
