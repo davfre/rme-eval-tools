@@ -316,12 +316,22 @@ RUNS_PHONES = [
     ("mode 4 (16-bit only), turning", 4, TURN),
     ("mode 1 (ramp), turning", 1, TURN),
 ]
+# Does the device move the volume itself?  Mode 5 writes nothing.
+RUNS_DEVICE = [
+    ("mode 5 (driver silent), five single clicks", 5,
+     "Turn the wheel ONE click, wait a second, repeat about five times."),
+    ("mode 5 (driver silent), turning", 5, TURN),
+    ("mode 0 (direct), turning, for comparison", 0, TURN),
+]
 RUNS = RUNS_OPTICAL
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
+    ap.add_argument("--runs", choices=("default", "device"),
+                    default="default",
+                    help="device: only the driver-silent comparison")
     ap.add_argument("--card", default="BabyfacePro")
     ap.add_argument("--out", default=None, help="keep recordings here")
     ap.add_argument("--seconds", type=int, default=12)
@@ -329,6 +339,8 @@ def main():
     card = Card(args.card)
     target = TARGETS[args.target]
     runs = RUNS_PHONES if args.target == "phones" else RUNS_OPTICAL
+    if args.runs == "device":
+        runs = RUNS_DEVICE
     dev = "hw:%s,0" % args.card
     outdir = args.out or tempfile.mkdtemp(prefix="wheel-probe-")
     os.makedirs(outdir, exist_ok=True)
