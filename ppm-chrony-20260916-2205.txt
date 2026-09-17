@@ -1,0 +1,56 @@
+device: /dev/bus/usb/005/003
+detached the kernel driver from interface 5
+
+Monitors off?  This arms the stream and changes the rate.
+Each line: measured IN byte rate -> the sample rate it implies
+under each frame layout.  OK = one of them is the rate asked for.
+
+== ppm: exact quad at 44100, 600 s, alt1 ==
+   quad: D495C5 9A41B8 8DB92E 880DEF
+   (check the host clock is disciplined: chronyc tracking)
+      59 s   44099.949 Hz
+     119 s   44099.965 Hz
+     179 s   44099.976 Hz
+     239 s   44099.956 Hz
+     299 s   44099.963 Hz
+     359 s   44099.951 Hz
+     419 s   44099.957 Hz
+     479 s   44099.962 Hz
+     539 s   44099.955 Hz
+     599 s   44099.958 Hz
+
+   exact @ 44100: 44099.9583 Hz  (-0.95 ppm)
+   Run q16 and exact alternately, twice each, and compare.
+could not re-attach (Invalid argument / Device or resource busy)
+get the card back with:
+  sudo modprobe -r snd_usb_babyface_pro && sudo modprobe snd_usb_babyface_pro
+
+done.
+device: /dev/bus/usb/005/003
+detached the kernel driver from interface 5
+
+Monitors off?  This arms the stream and changes the rate.
+Each line: measured IN byte rate -> the sample rate it implies
+under each frame layout.  OK = one of them is the rate asked for.
+
+== ppm: q16 quad at 44100, 600 s, alt1 ==
+   quad: D495C5 9A4154 8DB8A0 880DE6
+   (check the host clock is disciplined: chronyc tracking)
+      59 s   44100.625 Hz
+     119 s   44100.623 Hz
+     179 s   44100.623 Hz
+     239 s   44100.620 Hz
+     299 s   44100.622 Hz
+     359 s   44100.622 Hz
+     419 s   44100.622 Hz
+     479 s   44100.622 Hz
+     539 s   44100.622 Hz
+     599 s   44100.623 Hz
+
+   q16 @ 44100: 44100.6226 Hz  (+14.12 ppm)
+   Run q16 and exact alternately, twice each, and compare.
+could not re-attach (Invalid argument / Device or resource busy)
+get the card back with:
+  sudo modprobe -r snd_usb_babyface_pro && sudo modprobe snd_usb_babyface_pro
+
+done.

@@ -1,0 +1,32 @@
+device: /dev/bus/usb/005/003
+detached the kernel driver from interface 5
+
+Monitors off?  This arms the stream and changes the rate.
+Each line: measured IN byte rate -> the sample rate it implies
+under each frame layout.  OK = one of them is the rate asked for.
+
+== pitchfam: quad on top of family 44.1 kHz - absolute or relative? ==
+  48k-period quad, pitch 0   (abs 48000 / rel 44100)  2465.8 kB/s ->   44032 Hz (@56B)  0x11=1  
+  48k-period quad, +5 %      (abs 50400 / rel 46305)  2591.9 kB/s ->   46285 Hz (@56B)  0x11=1  
+  44.1k-period quad, +5 %    (abs 46305 / rel ~42542)  2379.8 kB/s ->   42496 Hz (@56B)  0x11=1  
+  44.1k-period quad, pitch 0 (abs 44100 / rel ~40517)  2265.1 kB/s ->   40448 Hz (@56B)  0x11=1  
+   and the control, family 44.1 with no quad at all:
+  family 44.1, no quad (expect 44100)  2265.1 kB/s ->   40448 Hz (@56B)  0x11=1  off
+could not re-attach (Resource temporarily unavailable / Device or resource busy)
+get the card back with:
+  sudo modprobe -r snd_usb_babyface_pro && sudo modprobe snd_usb_babyface_pro
+
+done.
+device: /dev/bus/usb/005/003
+detached the kernel driver from interface 5
+
+Monitors off?  This arms the stream and changes the rate.
+Each line: measured IN byte rate -> the sample rate it implies
+under each frame layout.  OK = one of them is the rate asked for.
+
+== ppm: family at 44100, 600 s, alt1 ==
+   family register only, no quad (a 48 kHz cold-init first)
+   (check the host clock is disciplined: chronyc tracking)
+      59 s   44100.192 Hz
+     119 s   44100.182 Hz
+     179 s   44100.179 Hz

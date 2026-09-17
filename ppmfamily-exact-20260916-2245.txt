@@ -1,0 +1,28 @@
+device: /dev/bus/usb/005/003
+detached the kernel driver from interface 5
+
+Monitors off?  This arms the stream and changes the rate.
+Each line: measured IN byte rate -> the sample rate it implies
+under each frame layout.  OK = one of them is the rate asked for.
+
+== ppm: family at 44100, 600 s, alt1 ==
+   family register only, no quad (a 48 kHz cold-init first)
+   (check the host clock is disciplined: chronyc tracking)
+      59 s   44099.950 Hz
+     119 s   44099.950 Hz
+     179 s   44099.947 Hz
+     239 s   44099.947 Hz
+     299 s   44099.937 Hz
+     359 s   44099.952 Hz
+     419 s   44099.952 Hz
+     479 s   44099.951 Hz
+     539 s   44099.950 Hz
+     599 s   44099.954 Hz
+
+   family @ 44100: 44099.9541 Hz  (-1.04 ppm)
+   Run q16 and exact alternately, twice each, and compare.
+could not re-attach (Invalid argument / Device or resource busy)
+get the card back with:
+  sudo modprobe -r snd_usb_babyface_pro && sudo modprobe snd_usb_babyface_pro
+
+done.

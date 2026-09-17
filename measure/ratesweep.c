@@ -48,6 +48,38 @@
 //             four bases, on the wire?
 //   rearm     repeated sessions with and without the 0x13 disarm, to test
 //             whether issue #5's silent restart is a missing disarm
+//   bank      which of the four banks does the device actually read?
+//             Send quads where one bank belongs to one base and the other
+//             three to another, and see which base the clock follows
+//   quads     print the quads the three models produce at each base,
+//             no hardware touched (for comparing against captures)
+//   family    does the FIRMWARE derive the clock from the 0x0030 family
+//             register when no quad is sent?  Leave the device at 48 kHz
+//             with a quad, then a session that writes family 0x0010 and
+//             NO quad.  44.1 kHz means the device does the arithmetic and
+//             the quad is only for pitch; 48 kHz means the host must send
+//             the quad and RME's driver does so at stream start (the
+//             2026-09-14 Windows captures were idle and saw no quad).
+//   famrb     does a 0x0030 write register at all from Linux?  Polls the
+//             0x11 readback after each family write, with three
+//             keepalive variants (none / 0x0001 / Windows' 0x0441).
+//             Measured: yes, at once, no keepalive needed
+//   famclob   which write in the cold-init tail resets the family
+//             register back to 48k?  Measured: 0x10 0x0021 0x05FF
+//   family9   all nine rates by family + alt, no quad, RME's exact
+//             rate-change sequence.  Does the family path cover
+//             64/128/176.4, which fell to 48/96/192 on PR #7 v1?
+//   f5ff      is 0x05FF (= 0x05CF | 0x0030) the settings word and the
+//             family register in one?  Writes bits 4-5 and reads 0x11
+//   pitchfam  varispeed on top of family 44.1 kHz: is the quad an
+//             absolute clock or a pitch relative to the family?
+//   ppm       long timed run to see which quad lands on nominal:
+//               ratesweep ppm <q16|exact|driver|family> [seconds] [base]
+//             `family` uses the family register and no quad, to see
+//             how exact the firmware's own derivation is
+//             default 600 s at 44100.  Times between IN URB completions
+//             so the URB granularity does not enter the result; needs
+//             the host clock NTP-disciplined (chronyc tracking)
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -59,6 +91,7 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include <linux/usbdevice_fs.h>
 
 #define VID 0x2a39
@@ -101,7 +134,12 @@ static int rd11(void)
 	c.data = b;
 	if (ioctl(fd, USBDEVFS_CONTROL, &c) != 4)
 		return -1;
-	return b[3] & 0x0F;	/* 2^alt + poll counter; see PROTOCOL.md */
+	/* (multiplier << 2) | family, multiplier 0/1/2 = x1/x2/x4, family
+	 * 0/1/2 = 32k/44.1k/48k - decoded from the 2026-09-14 Windows rate
+	 * captures, where it followed every 0x0030 write.  It echoes the
+	 * family REGISTER, not the clock: in `bank` it read 2 with the
+	 * clock at 44.1 kHz.  PROTOCOL.md's "2^alt + counter" is wrong. */
+	return b[3] & 0x0F;
 }
 
 static long long us(void)
@@ -230,6 +268,88 @@ static void dds_write(int base_hz)
 	ctl(0x10, 0x0001, 0x05CF);	/* commit, or the quad does not apply */
 }
 
+/* ---- explicit quads ---------------------------------------------- */
+
+/* RME's own arithmetic, recovered from the coldplug capture (2026-09-16).
+ * Bank 0 is the exact period; banks 1-3 are bank 0 scaled by a fixed Q16
+ * constant and truncated.  With
+ *
+ *   K = floor(65536 x 32000 / F),  F = 32000, 44100, 48000, 50000
+ *     = 0x10000, 0xB9C2, 0xAAAA, 0xA3D7
+ *
+ * this reproduces the captured 48 kHz quad byte for byte, fraction bytes
+ * included.  0xAAAA is 2/3 in Q16: these are hand-written constants, not
+ * the residue of a division.  The four banks are one period in four
+ * references, which is why bank 2 at the 32 kHz base (49999) is the
+ * 48 kHz bank 0, and bank 1 (54421) the 44.1 kHz bank 0.
+ *
+ * Which of the four the device reads is what mode `bank` measures. */
+static const unsigned long long q16_k[4] = { 65536, 47554, 43690, 41943 };
+
+static void quad_q16(int base_hz, int pitch, unsigned int out[4])
+{
+	double den = (double)base_hz * (1000.0 + pitch);
+	unsigned long long b0 =
+		(unsigned long long)(12800000000.0 * 48000.0 / den + 0.5);
+	int k;
+
+	out[0] = (unsigned int)b0;
+	for (k = 1; k < 4; k++)
+		out[k] = (unsigned int)((b0 * q16_k[k]) >> 16);
+}
+
+/* Every bank exact, rounded to the nearest 16.8 (the "compute exactly"
+ * proposal).  Differs from Q16 by up to 130 in the fraction byte. */
+static void quad_exact(int base_hz, int pitch, unsigned int out[4])
+{
+	static const double F[4] = { 32000, 44100, 48000, 50000 };
+	int k;
+
+	for (k = 0; k < 4; k++) {
+		double den = (double)base_hz * (1000.0 + pitch) * F[k];
+		out[k] = (unsigned int)(12800000000.0 * 48000.0 * 32000.0 / den
+					+ 0.5);
+	}
+}
+
+/* What dds_write() above sends today: integer-only banks 1/2 from fitted
+ * constants, bank 3 pinned at 0x7CFF.  Kept so the three can be printed
+ * side by side. */
+static void quad_driver(int base_hz, int pitch, unsigned int out[4])
+{
+	double den = (double)base_hz * (1000.0 + pitch);
+	unsigned int dds24 = (unsigned int)(12800000000.0 * 48000.0 / den + 0.5);
+	unsigned int d16 = dds24 >> 8;
+
+	out[0] = dds24;
+	out[1] = (unsigned int)(d16 * 0.72562 + 0.5) << 8;
+	out[2] = (unsigned int)(d16 * 2.0 / 3.0 + 0.5) << 8;
+	out[3] = 0x7CFF << 8;
+}
+
+/* Send four explicit 24-bit bank values.  wValue is 16 bits, so at the
+ * 32 kHz base bank 0's integer part (75000) goes out truncated to its low
+ * word, the same as the driver, and as RME's software must. */
+static void quad_write(const unsigned int b[4])
+{
+	int k;
+
+	for (k = 0; k < 4; k++)
+		ctl(0x1B, (b[k] >> 8) & 0xFFFF, ((b[k] & 0xFF) << 8) | k);
+	ctl(0x10, 0x0001, 0x05CF);	/* commit, or the quad does not apply */
+}
+
+/* If set, cold_init() sends this quad instead of synthesising one. */
+static const unsigned int *g_quad;
+/* If set, cold_init() sends NO quad at all (mode `family`). */
+static int g_noquad;
+/* If set, trial2() skips cold_init() entirely: the session sends only
+ * what RME's driver sends on a rate change (family + 0x0441 keepalive),
+ * then SET_INTERFACE and the arm.  Needs a previous session to have
+ * initialised the device. */
+static int g_minimal;
+static int g_minimal_family;
+
 /* ---- session ----------------------------------------------------- */
 
 /* The cold-start init, verbatim from babyfacepro.c's bf_cold_init().
@@ -244,7 +364,11 @@ static void cold_init(int base, int base_idx, int base_late, int dds_hz)
 			continue;
 		ctl(0x16, 0x0000, i);
 	}
-	if (dds_hz) {
+	if (g_noquad) {
+		/* nothing: is the family register alone enough? */
+	} else if (g_quad) {
+		quad_write(g_quad);
+	} else if (dds_hz) {
 		dds_write(dds_hz);
 	} else {
 		/* the verbatim 48 kHz coldplug quad the driver still sends */
@@ -313,7 +437,15 @@ static void trial2(const char *label, int want_hz, int base, int base_idx,
 {
 	int rb;
 
-	if (base_first) {
+	if (g_minimal) {
+		/* What RME's driver sends on a rate change (2026-09-14
+		 * Windows capture, idle): the family, the 0x0441 keepalive,
+		 * SET_INTERFACE if the multiplier changed.  Then we arm. */
+		ctl(0x10, g_minimal_family, 0x0030);
+		ctl(0x10, 0x0441, 0x05CF);
+		setif(alt);
+		usleep(50000);
+	} else if (base_first) {
 		cold_init(base, base_idx, base_late, dds_hz);
 		setif(alt);
 	} else {
@@ -638,6 +770,456 @@ static void mode_idx(void)
 	}
 }
 
+/* Which bank does the device read?  The four banks carry the same period
+ * in four references, so a consistent quad cannot tell.  Send a quad in
+ * which three banks belong to base B and one belongs to base A, and see
+ * which base the clock follows.  Four trials per direction, plus the two
+ * all-same controls.
+ *
+ * A = 48000 and B = 44100 are 8.8 % apart, far outside the measurement's
+ * 0.1 %, and both are real bases with every bank in range.
+ *
+ * Outcomes:
+ *   exactly one bank pulls the clock to A   -> that is the register; the
+ *                                              other three are don't-care
+ *   none does alone                         -> the device wants agreement
+ *                                              (or reads several)
+ *   the rate is neither A nor B             -> print it; it is data */
+static void mode_bank(void)
+{
+	static const int A = 48000, B = 44100;
+	unsigned int qa[4], qb[4], q[4];
+	int k, dir;
+
+	quad_q16(A, 0, qa);
+	quad_q16(B, 0, qb);
+
+	puts("\n== bank: which bank does the device read?  alt1 ==");
+	printf("   A = %d: %06X %06X %06X %06X\n", A, qa[0], qa[1], qa[2], qa[3]);
+	printf("   B = %d: %06X %06X %06X %06X\n", B, qb[0], qb[1], qb[2], qb[3]);
+
+	g_quad = qa;
+	trial2("control: all four from A", A, -1, 0x0030, 0, 1, 0, 0);
+	g_quad = qb;
+	trial2("control: all four from B", B, -1, 0x0030, 0, 1, 0, 0);
+
+	for (dir = 0; dir < 2; dir++) {
+		const unsigned int *one = dir ? qb : qa;
+		const unsigned int *rest = dir ? qa : qb;
+		int want = dir ? B : A;
+
+		for (k = 0; k < 4; k++) {
+			char l[64];
+
+			memcpy(q, rest, sizeof(q));
+			q[k] = one[k];
+			snprintf(l, sizeof(l), "bank%d from %c, rest from %c",
+				 k, dir ? 'B' : 'A', dir ? 'A' : 'B');
+			g_quad = q;
+			trial2(l, want, -1, 0x0030, 0, 1, 0, 0);
+		}
+	}
+	g_quad = NULL;
+}
+
+/* Does the firmware derive the DDS word from the 0x0030 family register
+ * on its own?  The 2026-09-14 Windows captures (idle) show RME's driver
+ * writing ONLY the family register on a rate change, never a quad, and
+ * the 0x11 status byte echoing it.  On Linux, `combo` found the family
+ * register inert - but every `combo` session also sent a quad afterwards,
+ * which would override anything the firmware derived.  This sends the
+ * family with no quad at all.
+ *
+ * Sequence: a 48 kHz session with a quad (known state), then family
+ * 0x0010 with no quad, then family 0x0000 with no quad, then back.  If
+ * the rate follows the family, the device does the arithmetic and the
+ * quad is only for pitch.  If it stays at 48 kHz, the host must send the
+ * quad and RME's driver does so at stream start. */
+static void mode_family(void)
+{
+	static const struct { int fam; int hz; const char *name; } t[] = {
+		{ 0x0010, 44100, "44.1k" },
+		{ 0x0000, 32000, "32k" },
+		{ 0x0020, 48000, "48k" },
+		{ 0x0010, 44100, "44.1k" },
+	};
+	int i;
+
+	puts("\n== family: what RME sends on a rate change, then a stream start ==");
+	puts("   reference session: full cold-init + 48 kHz quad.  Then sessions");
+	puts("   that send ONLY family + 0x0441 keepalive + SET_INTERFACE + arm:");
+	puts("   no cold-init, no quad, none of the tail our driver replays.");
+	puts("   (famrb: the family write registers at once.  The first run of");
+	puts("    this mode replayed the cold-init tail after it and 0x11 read 2");
+	puts("    on every row - our own sequence clobbered the register.)");
+	g_noquad = 0;
+	g_minimal = 0;
+	trial2("reference: 48 kHz quad, family 0x0020", 48000, 0x0020, 0x0030,
+	       0, 1, 0, 48000);
+	g_minimal = 1;
+	for (i = 0; i < (int)(sizeof(t) / sizeof(t[0])); i++) {
+		char l[64];
+
+		g_minimal_family = t[i].fam;
+		snprintf(l, sizeof(l), "family 0x%04X + 0x0441 only, want %s",
+			 t[i].fam, t[i].name);
+		trial2(l, t[i].hz, -1, 0x0030, 0, 1, 0, 0);
+	}
+	g_minimal = 0;
+	puts("   0x11 must read 1 / 0 / 2 / 1 down the rows.  Then the Hz column:");
+	puts("   follows the family = firmware derives the clock, quad is pitch only;");
+	puts("   stays 47923      = the quad is the clock and RME sends it at stream start.");
+}
+
+/* Does a 0x0030 family write REGISTER from Linux?  On Windows the 0x11
+ * status byte followed every family write within 30 ms.  In `family` it
+ * read 2 on every row while the family went 0x0010 / 0x0000 / 0x0020, so
+ * either ratesweep reads it too soon, or the write is not taking.  This
+ * writes the family and polls 0x11 for a second, with three variants of
+ * the keepalive that follows: none, the driver's 0x0001, and Windows'
+ * 0x0441.  No stream is armed. */
+static void mode_famrb(void)
+{
+	static const int keep[3] = { -1, 0x0001, 0x0441 };
+	static const int fams[3] = { 0x0010, 0x0000, 0x0020 };
+	int k, f, i;
+
+	puts("\n== famrb: does 0x0030 register?  0x11 byte 3 polled after each write ==");
+	for (k = 0; k < 3; k++) {
+		if (keep[k] < 0)
+			puts("  keepalive: none");
+		else
+			printf("  keepalive: 0x10 0x%04X 0x05CF\n", keep[k]);
+		for (f = 0; f < 3; f++) {
+			printf("    family 0x%04X:", fams[f]);
+			ctl(0x10, fams[f], 0x0030);
+			if (keep[k] >= 0)
+				ctl(0x10, keep[k], 0x05CF);
+			for (i = 0; i < 25; i++) {
+				printf(" %X", rd11());
+				fflush(stdout);
+				usleep(40000);
+			}
+			putchar('\n');
+		}
+	}
+	puts("  (expect the last hex to become 1 / 0 / 2 for 0x0010 / 0x0000 / 0x0020)");
+}
+
+/* Which write in the cold-init tail resets the family register?  Write
+ * family 0x0010, confirm 0x11 = 1, then replay the tail one write at a
+ * time, reading 0x11 after each.  The first write after which it stops
+ * being 1 is the one.  The driver's bf_cold_init() runs this same tail,
+ * so whatever it is, the driver does it too. */
+static void mode_famclob(void)
+{
+	static const struct { int req, val, idx; const char *what; } tail[] = {
+		{ 0x1C, 0x0000, 0x0000, "0x1C 0x0000 0x0000" },
+		{ 0x10, 0x0021, 0x05FF, "0x10 0x0021 0x05FF" },
+		{ 0x17, 0x000C, 0x0000, "0x17 0x000C 0x0000" },
+		{ 0x21, 0x0000, 0x0000, "0x21 0x0000 0x0000" },
+		{ 0x10, 0x0000, 0x3000, "0x10 0x0000 0x3000 (1st)" },
+		{ 0x10, 0x0000, 0x3000, "0x10 0x0000 0x3000 (2nd)" },
+		{ 0x10, 0x0800, 0x0800, "0x10 0x0800 0x0800 (1st)" },
+		{ 0x10, 0x0800, 0x0800, "0x10 0x0800 0x0800 (2nd)" },
+		{ 0x10, 0x0800, 0x0800, "0x10 0x0800 0x0800 (3rd)" },
+	};
+	int i, k;
+
+	puts("\n== famclob: which cold-init write resets the family register? ==");
+	puts("   also the 0x16 clear loop, run first, in case it is that");
+
+	ctl(0x10, 0x0010, 0x0030);
+	usleep(50000);
+	printf("  after family 0x0010:            0x11=%X\n", rd11());
+	for (i = 0; i <= 0x3D; i++) {
+		if (i == 0x1E || i == 0x1F)
+			continue;
+		ctl(0x16, 0x0000, i);
+	}
+	usleep(50000);
+	printf("  after the 0x16 clear loop:      0x11=%X\n", rd11());
+
+	ctl(0x10, 0x0010, 0x0030);
+	usleep(50000);
+	printf("  after family 0x0010 again:      0x11=%X\n", rd11());
+	for (k = 0; k < (int)(sizeof(tail) / sizeof(tail[0])); k++) {
+		ctl(tail[k].req, tail[k].val, tail[k].idx);
+		usleep(50000);
+		printf("  after %-28s 0x11=%X\n", tail[k].what, rd11());
+	}
+	puts("  (the first line that is not 1 names the clobbering write)");
+}
+
+/* All nine rates through RME's own mechanism: family register + alt,
+ * no quad, no cold-init, sessions that send only what the Windows
+ * capture shows on a rate change.  On PR #7 v1, whose family write
+ * survived by accident (restore_state re-wrote it after cold-init had
+ * clobbered it), Ismail measured 64 -> 48, 128 -> 96, 176.4 -> 192:
+ * family 0 at x2/x4 and family 1 at x4 all fell to the 48 kHz family.
+ * `family` only tested alt 1.  This is the same test at all three alts:
+ * does the firmware's family-derived clock cover the whole table, or
+ * does the host have to send a quad for three of the nine? */
+static void mode_family9(void)
+{
+	static const struct { int fam, alt, hz; } t[] = {
+		{ 0x0000, 1,  32000 }, { 0x0010, 1,  44100 }, { 0x0020, 1,  48000 },
+		{ 0x0000, 2,  64000 }, { 0x0010, 2,  88200 }, { 0x0020, 2,  96000 },
+		{ 0x0000, 3, 128000 }, { 0x0010, 3, 176400 }, { 0x0020, 3, 192000 },
+	};
+	int i;
+
+	puts("\n== family9: all nine rates by family register + alt, no quad ==");
+	g_noquad = 0;
+	g_minimal = 0;
+	trial2("reference: 48 kHz quad, family 0x0020", 48000, 0x0020, 0x0030,
+	       0, 1, 0, 48000);
+	g_minimal = 1;
+	for (i = 0; i < (int)(sizeof(t) / sizeof(t[0])); i++) {
+		char l[64];
+
+		g_minimal_family = t[i].fam;
+		snprintf(l, sizeof(l), "family 0x%04X alt%d, want %d",
+			 t[i].fam, t[i].alt, t[i].hz);
+		trial2(l, t[i].hz, -1, 0x0030, 0, t[i].alt, 0, 0);
+	}
+	g_minimal = 0;
+	puts("   any row landing on a 48 kHz-family rate instead of the one asked");
+	puts("   is a rate the family register cannot reach on its own.");
+}
+
+/* Is 0x05FF the settings word and the family register in one?
+ * 0x05FF = 0x05CF | 0x0030, and the cold-init value 0x0021 has bits
+ * 4-5 = 2 (48 kHz family) and bit 0 = internal clock.  Write three
+ * values with different bits 4-5 and read 0x11 after each. */
+static void mode_f5ff(void)
+{
+	static const int vals[4] = { 0x0011, 0x0001, 0x0021, 0x0011 };
+	int i;
+
+	puts("\n== f5ff: does 0x05FF carry the family in bits 4-5? ==");
+	ctl(0x10, 0x0020, 0x0030);
+	usleep(50000);
+	printf("  family 0x0020 via 0x0030:   0x11=%X\n", rd11());
+	for (i = 0; i < 4; i++) {
+		ctl(0x10, vals[i], 0x05FF);
+		usleep(50000);
+		printf("  0x%04X -> 0x05FF:           0x11=%X   (bits 4-5 = %d)\n",
+		       vals[i], rd11(), (vals[i] >> 4) & 3);
+	}
+	puts("  (0x11 following bits 4-5 means 0x05FF writes the family too)");
+}
+
+/* Varispeed at a base other than 48 kHz: is the quad an ABSOLUTE clock
+ * that overrides the family, or a pitch RELATIVE to it?  TotalMix's
+ * pitch capture was at 48 kHz, where the two are indistinguishable.
+ * Every session here: RME's rate-change sequence for family 44.1 kHz,
+ * then a quad, then arm.
+ *
+ *   48 kHz-period quad, pitch 0     absolute -> 48000   relative -> 44100
+ *   48 kHz-period quad, +5 %        absolute -> 50400   relative -> 46305
+ *   44.1 kHz-period quad, +5 %      absolute -> 46305   relative -> ~42542
+ *
+ * Decides how bf_pitch_put() has to compute its word. */
+static void mode_pitchfam(void)
+{
+	static const struct { int base, pitch; const char *what; } t[] = {
+		{ 48000,  0, "48k-period quad, pitch 0   (abs 48000 / rel 44100)" },
+		{ 48000, 50, "48k-period quad, +5 %      (abs 50400 / rel 46305)" },
+		{ 44100, 50, "44.1k-period quad, +5 %    (abs 46305 / rel ~42542)" },
+		{ 44100,  0, "44.1k-period quad, pitch 0 (abs 44100 / rel ~40517)" },
+	};
+	unsigned int q[4];
+	int i;
+
+	puts("\n== pitchfam: quad on top of family 44.1 kHz - absolute or relative? ==");
+	setif(1);
+	cold_init(-1, 0x0030, 0, 48000);
+	arm(1);
+	measure(500, urbsize_for_alt(1));
+	disarm();
+
+	for (i = 0; i < (int)(sizeof(t) / sizeof(t[0])); i++) {
+		int rb;
+
+		quad_q16(t[i].base, t[i].pitch, q);
+		ctl(0x10, 0x0010, 0x0030);
+		ctl(0x10, 0x0441, 0x05CF);
+		setif(1);
+		quad_write(q);
+		usleep(50000);
+		rb = rd11();
+		arm(1);
+		report(t[i].what, 0, measure(MEAS_MS, urbsize_for_alt(1)), 1, rb);
+		disarm();
+	}
+	puts("   and the control, family 44.1 with no quad at all:");
+	ctl(0x10, 0x0010, 0x0030);
+	ctl(0x10, 0x0441, 0x05CF);
+	setif(1);
+	usleep(50000);
+	arm(1);
+	report("family 44.1, no quad (expect 44100)", 44100,
+	       measure(MEAS_MS, urbsize_for_alt(1)), 1, rd11());
+	disarm();
+}
+
+/* ---- the ppm run ------------------------------------------------- */
+
+static long long now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+/* Measure the IN byte rate over a long window, timing between URB
+ * completions.  The bytes in URB i arrive between completion i-1 and
+ * completion i, so: take the first completion as t0 and count nothing,
+ * then count every later URB's bytes and take the last completion as
+ * t1.  bytes / (t1 - t0) then has no start/stop quantisation at all;
+ * the only limit left is the host clock, which CLOCK_MONOTONIC keeps
+ * NTP-disciplined in frequency.  Blocking reaps, so it does not spin. */
+static double measure_long(int seconds, int sz, int frame)
+{
+	long long t0 = -1, t1 = 0, bytes = 0, next_report;
+	long long deadline = now_ns() + (long long)seconds * 1000000000LL;
+	int n = 0;
+
+	next_report = now_ns() + 60000000000LL;
+	for (;;) {
+		struct usbdevfs_urb *done = NULL;
+		long long t;
+
+		if (ioctl(fd, USBDEVFS_REAPURB, &done) < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "  ! reap: %s\n", strerror(errno));
+			break;
+		}
+		t = now_ns();
+		if (done->endpoint == EP_IN) {
+			if (t0 < 0) {
+				t0 = t;
+			} else {
+				bytes += done->actual_length;
+				t1 = t;
+				n++;
+			}
+		}
+		done->buffer_length = sz;
+		ioctl(fd, USBDEVFS_SUBMITURB, done);
+
+		if (t >= next_report && t0 >= 0 && n > 0) {
+			double hz = bytes / ((t1 - t0) / 1e9) / frame;
+
+			printf("    %4lld s  %10.3f Hz\n", (t1 - t0) / 1000000000LL, hz);
+			fflush(stdout);
+			next_report += 60000000000LL;
+		}
+		if (t >= deadline && t0 >= 0 && n > 0)
+			break;
+	}
+	if (t1 <= t0)
+		return 0;
+	return bytes / ((t1 - t0) / 1e9);
+}
+
+static void mode_ppm(const char *model, int seconds, int base)
+{
+	unsigned int q[4];
+	double bps, hz, ppm;
+	int family_mode = !strcmp(model, "family");
+
+	if (family_mode) {
+		/* RME's own mechanism: family register, no quad.  The
+		 * firmware derives the DDS word; this measures how exactly. */
+	} else if (!strcmp(model, "q16"))
+		quad_q16(base, 0, q);
+	else if (!strcmp(model, "exact"))
+		quad_exact(base, 0, q);
+	else if (!strcmp(model, "driver"))
+		quad_driver(base, 0, q);
+	else {
+		fprintf(stderr, "ppm: model must be q16, exact, driver or family\n");
+		return;
+	}
+
+	printf("\n== ppm: %s at %d, %d s, alt1 ==\n", model, base, seconds);
+	if (family_mode)
+		puts("   family register only, no quad (a 48 kHz cold-init first)");
+	else
+		printf("   quad: %06X %06X %06X %06X\n", q[0], q[1], q[2], q[3]);
+	puts("   (check the host clock is disciplined: chronyc tracking)");
+
+	if (family_mode) {
+		int fam = base == 32000 ? 0x0000 : base == 44100 ? 0x0010 : 0x0020;
+		unsigned int one[4];
+
+		/* The quad is a pitch RATIO against the device's 48 kHz
+		 * reference and it is sticky (pitchfam, 2026-09-16), so the
+		 * reference session must leave an EXACT x1.0 quad in place,
+		 * not the driver's approximation (x1.00001) and not RME's Q16
+		 * word (x1.000015).  Then the family alone sets the rate and
+		 * this measures the firmware's own derivation. */
+		quad_exact(48000, 0, one);
+		g_quad = one;
+		setif(1);
+		cold_init(-1, 0x0030, 0, 0);
+		g_quad = NULL;
+		arm(1);
+		measure(500, urbsize_for_alt(1));
+		disarm();
+		/* then exactly what RME sends on a rate change */
+		ctl(0x10, fam, 0x0030);
+		ctl(0x10, 0x0441, 0x05CF);
+		setif(1);
+		usleep(50000);
+	} else {
+		g_quad = q;
+		setif(1);
+		cold_init(-1, 0x0030, 0, 0);
+	}
+	arm(1);
+	bps = measure_long(seconds, urbsize_for_alt(1), frame_for_alt(1));
+	disarm();
+	g_quad = NULL;
+
+	hz = bps / frame_for_alt(1);
+	ppm = (hz / base - 1.0) * 1e6;
+	printf("\n   %s @ %d: %.4f Hz  (%+.2f ppm)\n", model, base, hz, ppm);
+	puts("   Run q16 and exact alternately, twice each, and compare.");
+}
+
+/* No hardware: print what the three models send at each base, so a
+ * Windows capture can be compared against them by eye. */
+static void mode_quads(void)
+{
+	static const int bases[3] = { 32000, 44100, 48000 };
+	static const int pitches[3] = { -50, 0, 50 };
+	int b, p;
+
+	puts("base    pitch  model    bank0    bank1    bank2    bank3");
+	for (b = 0; b < 3; b++) {
+		for (p = 0; p < 3; p++) {
+			unsigned int q[4];
+
+			quad_q16(bases[b], pitches[p], q);
+			printf("%-7d %+4d   q16     %06X   %06X   %06X   %06X\n",
+			       bases[b], pitches[p], q[0], q[1], q[2], q[3]);
+			quad_exact(bases[b], pitches[p], q);
+			printf("%-7d %+4d   exact   %06X   %06X   %06X   %06X\n",
+			       bases[b], pitches[p], q[0], q[1], q[2], q[3]);
+			quad_driver(bases[b], pitches[p], q);
+			printf("%-7d %+4d   driver  %06X   %06X   %06X   %06X\n",
+			       bases[b], pitches[p], q[0], q[1], q[2], q[3]);
+		}
+	}
+	puts("\nbank0 above 0xFFFFFF (the 32 kHz base) goes on the wire as its"
+	     " low 16 bits of integer part; the others are in range.");
+}
+
 /* ---- device discovery -------------------------------------------- */
 
 static int open_device(const char *forced)
@@ -691,6 +1273,27 @@ int main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "sweep";
 	const char *dev = argc > 2 ? argv[2] : NULL;
 	int i, iface = IFACE;
+	int ppm_secs = 600, ppm_base = 44100;
+	const char *ppm_model = NULL;
+
+	if (!strcmp(mode, "quads")) {
+		mode_quads();
+		return 0;
+	}
+	if (!strcmp(mode, "ppm")) {
+		/* ppm <model> [seconds] [base]; the device is auto-detected */
+		if (argc < 3) {
+			fprintf(stderr, "usage: ratesweep ppm <q16|exact|driver> "
+				"[seconds] [base]\n");
+			return 1;
+		}
+		ppm_model = argv[2];
+		dev = NULL;
+		if (argc > 3)
+			ppm_secs = atoi(argv[3]);
+		if (argc > 4)
+			ppm_base = atoi(argv[4]);
+	}
 
 	fd = open_device(dev);
 	if (fd < 0) {
@@ -755,10 +1358,19 @@ int main(int argc, char **argv)
 	else if (!strcmp(mode, "pitch"))    mode_pitch();
 	else if (!strcmp(mode, "rearm"))    mode_rearm();
 	else if (!strcmp(mode, "idx"))      mode_idx();
+	else if (!strcmp(mode, "bank"))     mode_bank();
+	else if (!strcmp(mode, "ppm"))      mode_ppm(ppm_model, ppm_secs, ppm_base);
+	else if (!strcmp(mode, "family"))   mode_family();
+	else if (!strcmp(mode, "famrb"))    mode_famrb();
+	else if (!strcmp(mode, "famclob"))  mode_famclob();
+	else if (!strcmp(mode, "family9"))  mode_family9();
+	else if (!strcmp(mode, "f5ff"))     mode_f5ff();
+	else if (!strcmp(mode, "pitchfam")) mode_pitchfam();
 	else {
 		fprintf(stderr, "unknown mode: %s\n"
 			"modes: sweep alts order clobber scanbase idx dds "
-			"ddsscan combo table bank3 pitch rearm\n", mode);
+			"ddsscan combo table bank3 pitch rearm bank quads ppm "
+			"family famrb famclob family9 f5ff pitchfam\n", mode);
 		return 1;
 	}
 

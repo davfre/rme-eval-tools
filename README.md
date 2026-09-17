@@ -32,8 +32,15 @@ re-attaches on exit. If the re-attach fails it says so; recover with
 Monitors off for all of them: they arm the stream and change the rate.
 
 `ratesweep` has modes (`sweep`, `table`, `dds`, `ddsscan`, `pitch`, `bank3`,
-`combo`, `idx`, `alts`, `order`, `clobber`, `scanbase`); run it with an unknown
-one to list them. Each corresponds to a hypothesis in `../rate-analysis.md`.
+`bank`, `combo`, `idx`, `alts`, `order`, `clobber`, `scanbase`, `rearm`); run
+it with an unknown one to list them. Each corresponds to a hypothesis in
+`../rate-analysis.md`. `ratesweep quads` needs no hardware: it prints the
+DDS quads the three candidate models produce at each base, for comparing
+against a capture. `ratesweep ppm <q16|exact|driver> [seconds] [base]` is
+the long run that decides between them: ten minutes at 44.1 kHz per model,
+timed between IN URB completions so URB granularity does not enter it.
+Check `chronyc tracking` first; the result is only as good as the host
+clock, and run the models alternately rather than back to back.
 
 ## driver/
 
