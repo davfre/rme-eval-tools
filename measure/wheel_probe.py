@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """wheel_probe.py - measure what the front-panel OUT wheel does to the audio.
 
-Plays a steady 997 Hz tone into the optical output (ADAT7/8) only,
-records that output back through the device loopback, and asks you to
-turn the wheel with the panel's OUT selection on Opt.  Nothing reaches
-the analog outputs: AN1/2, PH3/4 and the other digital outputs are
-muted for the duration and the mixer is restored afterwards.
+Plays a steady 997 Hz tone into one output and records it back while you
+turn the wheel with the panel's OUT selection on that output.
+
+  --target optical  (default) ADAT7/8, recorded through the device
+                    loopback: the digital signal only.  The analog
+                    outputs stay muted.
+  --target phones   PH3/4, recorded through a patch cable from the
+                    headphone jack into IN3: the real analog output.
+                    AN1/2 and the digital outputs are muted, and every
+                    input is removed from every output first, so IN3
+                    cannot feed back.  Nothing else may be plugged into
+                    either headphone jack.
+
+The mixer is restored afterwards.
 
 The recording is analysed sample by sample.  A pure sine obeys
 x[n] = 2cos(w) x[n-1] - x[n-2]; the residual of that prediction is
@@ -25,7 +34,8 @@ PipeWire (`just eval-wheel` does both the release and the hand-back),
 alsa-utils, sudo for the module parameter, and nothing connected to the
 optical output.
 
-Usage: wheel_probe.py [--card BabyfacePro] [--out DIR] [--seconds 12]
+Usage: wheel_probe.py [--target optical|phones] [--card BabyfacePro]
+                      [--out DIR] [--seconds 12]
 """
 import argparse
 import math
@@ -43,9 +53,19 @@ CH = 12
 FREQ = 997.0
 TONE_DBFS = -12.0
 PB_CH = (10, 11)          # PB6 = playback words 10/11
-OUT = 5                   # ADAT7/8
-REC_CH = (8, 9)           # loopback of out 5 = words 10/11 = capture ch 8/9
 PB6_SRC = 13
+SOURCES = ("AN1", "AN2", "AN3", "AN4", "AS1/2", "ADAT3/4", "ADAT5/6",
+           "ADAT7/8", "PB1", "PB2", "PB3", "PB4", "PB5", "PB6")
+OUTPUTS = ("AN1/2", "PH3/4", "AS1/2", "ADAT3/4", "ADAT5/6", "ADAT7/8")
+
+# out: output index; rec: capture channels to analyse (None = find the
+# channel carrying the tone); loopback: use the device loopback.
+TARGETS = {
+    "optical": {"out": 5, "rec": (8, 9), "loopback": True,
+                "panel": "Opt"},
+    "phones": {"out": 1, "rec": None, "loopback": False,
+               "panel": "Phones"},
+}
 FADER_0DB = 0x16a0
 MASTER_START = 0x0333     # -20 dB, room to turn both ways
 PARAM = "/sys/module/snd_usb_babyface_pro/parameters/wheel_mode"
@@ -91,26 +111,37 @@ def set_mode(mode):
                    stdout=subprocess.DEVNULL, check=True)
 
 
-def setup(card):
-    # Silence everything except the optical output.
-    for i, name in enumerate(("AN1/2", "PH3/4", "AS1/2", "ADAT3/4",
-                              "ADAT5/6")):
-        card.cset(name + " Playback Switch", "off", index=i)
-    card.cset("ADAT7/8 Playback Switch", "on", index=OUT)
-    # Only PB6 into the optical output, at 0 dB.
-    for src in range(14):
-        names = ("AN1", "AN2", "AN3", "AN4", "AS1/2", "ADAT3/4", "ADAT5/6",
-                 "ADAT7/8", "PB1", "PB2", "PB3", "PB4", "PB5", "PB6")
-        val = FADER_0DB if src == PB6_SRC else 0
-        card.cset(names[src] + " Playback Volume", "%d,%d" % (val, val),
-                  index=OUT * 14 + src)
+def setup(card, target):
+    out = target["out"]
+    # Every output silent except the target.
+    for i, name in enumerate(OUTPUTS):
+        card.cset(name + " Playback Switch", "on" if i == out else "off",
+                  index=i)
+    # Remove every source from every output, then PB6 into the target
+    # only.  Clearing the inputs everywhere is what keeps a cable from
+    # an output back into an input from feeding back.
+    for o in range(6):
+        for src in range(14):
+            val = FADER_0DB if (o == out and src == PB6_SRC) else 0
+            card.cset(SOURCES[src] + " Playback Volume",
+                      "%d,%d" % (val, val), index=o * 14 + src)
+    for o in range(6):
+        for src in range(8):
+            got = card.cget(SOURCES[src] + " Playback Volume",
+                            index=o * 14 + src)
+            if any(got):
+                raise RuntimeError("input %s still routed to %s"
+                                   % (SOURCES[src], OUTPUTS[o]))
     for i in range(6):
-        card.cset("Loopback Switch", "on" if i == OUT else "off", index=i)
+        card.cset("Loopback Switch",
+                  "on" if (target["loopback"] and i == out) else "off",
+                  index=i)
 
 
-def start_master(card):
-    card.cset("ADAT7/8 Playback Volume",
-              "%d,%d" % (MASTER_START, MASTER_START), index=OUT)
+def start_master(card, target):
+    out = target["out"]
+    card.cset(OUTPUTS[out] + " Playback Volume",
+              "%d,%d" % (MASTER_START, MASTER_START), index=out)
 
 
 def tone_second():
@@ -153,12 +184,20 @@ def run(card, dev, seconds, path):
     play.wait()
 
 
-def load(path, ch):
+def load(path, chans):
+    """The recording's channels `chans`; with None, the two capture
+    channels carrying the most signal (the patched input)."""
     with open(path, "rb") as f:
         data = f.read()
     frames = len(data) // (CH * 4)
     vals = struct.unpack_from("<%di" % (frames * CH), data)
-    return [v / 2147483648.0 for v in vals[ch::CH]]
+    if chans is None:
+        peak = [max(abs(v) for v in vals[c::CH][RATE // 2:]) for c in range(CH)]
+        chans = sorted(range(CH), key=lambda c: -peak[c])[:2]
+        chans.sort()
+        print("   tone found on capture ch %s (peak %.1f dBFS)"
+              % (chans, 20 * math.log10(max(peak[chans[0]], 1) / 2 ** 31)))
+    return [[v / 2147483648.0 for v in vals[c::CH]] for c in chans]
 
 
 def save_wav(path, left, right):
@@ -247,7 +286,7 @@ def report(label, res, before, after):
     return {"label": label, "steps": len(s), "glitches": len(g)}
 
 
-RUNS = [
+RUNS_OPTICAL = [
     ("baseline, wheel untouched", 1,
      "Do NOT touch the wheel during this run."),
     ("mode 0 (direct), five single clicks", 0,
@@ -262,14 +301,34 @@ RUNS = [
      "Turn the wheel slowly up and down, then quickly, until it stops."),
 ]
 
+TURN = "Turn the wheel slowly up and down, then quickly, until it stops."
+RUNS_PHONES = [
+    ("baseline, wheel untouched", 1,
+     "Do NOT touch the wheel during this run."),
+    ("mode 0 (direct), five single clicks", 0,
+     "Turn the wheel ONE click, wait a second, repeat about five times."),
+    ("mode 3 (8-bit only), five single clicks", 3,
+     "Turn the wheel ONE click, wait a second, repeat about five times."),
+    ("mode 4 (16-bit only), five single clicks", 4,
+     "Turn the wheel ONE click, wait a second, repeat about five times."),
+    ("mode 0 (direct), turning", 0, TURN),
+    ("mode 3 (8-bit only), turning", 3, TURN),
+    ("mode 4 (16-bit only), turning", 4, TURN),
+    ("mode 1 (ramp), turning", 1, TURN),
+]
+RUNS = RUNS_OPTICAL
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
     ap.add_argument("--card", default="BabyfacePro")
     ap.add_argument("--out", default=None, help="keep recordings here")
     ap.add_argument("--seconds", type=int, default=12)
     args = ap.parse_args()
     card = Card(args.card)
+    target = TARGETS[args.target]
+    runs = RUNS_PHONES if args.target == "phones" else RUNS_OPTICAL
     dev = "hw:%s,0" % args.card
     outdir = args.out or tempfile.mkdtemp(prefix="wheel-probe-")
     os.makedirs(outdir, exist_ok=True)
@@ -279,8 +338,13 @@ def main():
                  "driver first.")
     if not os.path.exists(PARAM):
         sys.exit("No wheel_mode parameter: load the wheel-debug driver first.")
-    print("Nothing may be connected to the optical output. The analog "
-          "outputs stay muted.")
+    if args.target == "phones":
+        print("Patch cable from a headphone jack into IN3. Nothing else in "
+              "either headphone jack.\nKeep the turns moderate: very high "
+              "levels can clip IN3.")
+    else:
+        print("Nothing may be connected to the optical output. The analog "
+              "outputs stay muted.")
     if input("Type yes to continue: ").strip() != "yes":
         return
 
@@ -289,13 +353,13 @@ def main():
     old_mode = open(PARAM).read().strip()
     results = []
     try:
-        setup(card)
-        print("\nOn the Babyface, press OUT until Opt is selected "
-              "(the wheel must control the optical output).")
+        setup(card, target)
+        print("\nOn the Babyface, press OUT until %s is selected "
+              "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        for label, mode, what in RUNS:
+        for label, mode, what in runs:
             set_mode(mode)
-            start_master(card)
+            start_master(card, target)
             print("\n-- %s\n   %s" % (label, what))
             input("   Press Enter, then start within a second "
                   "(%d s recording). " % args.seconds)
@@ -303,14 +367,14 @@ def main():
             raw = os.path.join(outdir, "run%d.raw" % len(results))
             run(card, dev, args.seconds, raw)
             after = card.counters()
-            left, right = load(raw, REC_CH[0]), load(raw, REC_CH[1])
+            left, right = load(raw, target["rec"])
             save_wav(raw[:-4] + ".wav", left, right)
             os.remove(raw)
             results.append(report(label, analyse(left), before, after))
     finally:
         set_mode(old_mode)
         subprocess.run(["alsactl", "-f", saved, "restore", args.card])
-    print("\nRecordings (loopback of the optical output): %s" % outdir)
+    print("\nRecordings (%s): %s" % (args.target, outdir))
     print("Mixer restored, wheel_mode back to %s." % old_mode)
 
 
