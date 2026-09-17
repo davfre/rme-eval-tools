@@ -65,7 +65,13 @@ TARGETS = {
                 "panel": "Opt"},
     "phones": {"out": 1, "rec": None, "loopback": False,
                "panel": "Phones"},
+    # Optical out cabled to optical in: the real optical signal.
+    "optical-cable": {"out": 5, "rec": None, "loopback": False,
+                      "panel": "Opt"},
 }
+# Capture channels 10/11 carry a fixed-gain playback tap, never the
+# patched input.
+TAP_CH = (10, 11)
 FADER_0DB = 0x16a0
 MASTER_START = 0x0333     # -20 dB, room to turn both ways
 PARAM = "/sys/module/snd_usb_babyface_pro/parameters/wheel_mode"
@@ -207,7 +213,8 @@ def load(path, chans):
     vals = struct.unpack_from("<%di" % (frames * CH), data)
     if chans is None:
         peak = [max(abs(v) for v in vals[c::CH][RATE // 2:]) for c in range(CH)]
-        chans = sorted(range(CH), key=lambda c: -peak[c])[:2]
+        chans = sorted((c for c in range(CH) if c not in TAP_CH),
+                       key=lambda c: -peak[c])[:2]
         chans.sort()
         print("   tone found on capture ch %s (peak %.1f dBFS)"
               % (chans, 20 * math.log10(max(peak[chans[0]], 1) / 2 ** 31)))
@@ -364,7 +371,10 @@ def main():
                  "driver first.")
     if not os.path.exists(PARAM):
         sys.exit("No wheel_mode parameter: load the wheel-debug driver first.")
-    if args.target == "phones":
+    if args.target == "optical-cable":
+        print("Optical cable from the optical output into the optical "
+              "input. The analog outputs stay muted.")
+    elif args.target == "phones":
         print("Patch cable from a headphone jack into IN3. Nothing else in "
               "either headphone jack.\nKeep the turns moderate: very high "
               "levels can clip IN3.")
