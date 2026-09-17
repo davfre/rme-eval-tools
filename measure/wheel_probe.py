@@ -377,14 +377,16 @@ def kmsg_events(lines, tag):
 
 
 def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
-              balance=False):
+              balance=False, floor=False):
     """Record turns with the driver silent (trace) or, with check, in
     wheel_mode 1, and compare the driver's cached level with the level
     the device ends at."""
     import json
-    name = "check" if check else "balance" if balance else "trace"
-    kinds = (CHECK_KINDS if check else
+    name = ("check" if check else "floor" if floor else
+            "balance" if balance else "trace")
+    kinds = (CHECK_KINDS if check else FLOOR_KINDS if floor else
              BALANCE_KINDS if balance else TRACE_KINDS)
+    balance = balance or floor
     set_mode(1 if check else 5)
     sides = recorded_sides(card, dev, target, outdir) if balance else {}
     side = min(sides) if sides else 0
@@ -394,7 +396,11 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
     runs = [k for _ in range(repeats) for k in kinds]
     meta = []
     try:
-        for n, (label, start_db, what) in enumerate(runs):
+        for n, kind in enumerate(runs):
+            label, start_db, what = kind[:3]
+            opts = kind[3] if len(kind) > 3 else {}
+            RUN_TONE_DBFS[0] = opts.get("tone_dbfs", TRACE_TONE_DBFS)
+            secs = opts.get("seconds", seconds)
             out = target["out"]
             if isinstance(start_db, tuple):
                 pair = start_db
@@ -410,7 +416,7 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
             input("   Press Enter, hands off, and wait for GO. ")
             tag = "%s%d-%d" % (name, os.getpid(), n)
             raw = os.path.join(outdir, "%s-%02d.raw" % (name, n))
-            run(card, dev, seconds, raw,
+            run(card, dev, secs, raw,
                 go=lambda: print("   >>> GO <<<", flush=True),
                 before_rec=lambda: kmsg_mark(tag))
             out_lines = subprocess.run(["sudo", "dmesg"], capture_output=True,
@@ -478,13 +484,13 @@ def run_trace(card, dev, target, seconds, outdir, repeats, check=False,
                 entry["wav_channels"] = "left, right"
             meta.append({"n": n, "label": label, "start_db": start_db,
                          "master": master_for_db(start_db),
-                         "tone_dbfs": TRACE_TONE_DBFS,
+                         "tone_dbfs": RUN_TONE_DBFS[0],
                          "wav": os.path.basename(wav), "marker_found":
                          t0 is not None, "events": events,
                          "level_start": db0, "level_end": db1,
                          "clipped": clip, **entry})
             with open(os.path.join(outdir, name + ".json"), "w") as f:
-                json.dump({"tone_dbfs": TRACE_TONE_DBFS, "rate": RATE,
+                json.dump({"tone_dbfs": RUN_TONE_DBFS[0], "rate": RATE,
                            "go_s": 1.5, "runs": meta}, f, indent=1)
     finally:
         RUN_TONE_DBFS[0] = None
@@ -742,6 +748,23 @@ BALANCE_KINDS = [
     ("balance fast up L-40 R-28", (-40, -28), "CLOCKWISE: " + FAST),
     ("balance fast up L-28 R-40", (-28, -40), "CLOCKWISE: " + FAST),
 ]
+# floor: down to silence and back, driver silent.  A louder tone keeps
+# the level above the input noise further down; the turns stay below
+# -30 dB so it cannot clip.
+FLOOR = {"tone_dbfs": -6.0, "seconds": 30}
+FLOOR_KINDS = [
+    ("floor slow down from -30, then up", (-30, -30),
+     "ANTICLOCKWISE, one click at a time with a short pause, until the "
+     "tone is gone plus 3 more clicks (about 25). Pause 2 s. Then "
+     "CLOCKWISE the same way, about 15 clicks", FLOOR),
+    ("floor slow down from -30 with balance", (-30, -40),
+     "ANTICLOCKWISE, one click at a time with a short pause, until both "
+     "sides are gone plus 3 more clicks (about 25)", FLOOR),
+    ("floor fast down from -30, then slow up", (-30, -30),
+     "ANTICLOCKWISE in one quick flick, about 15 clicks. Pause 2 s. Then "
+     "CLOCKWISE one click at a time with a short pause, about 15 clicks",
+     FLOOR),
+]
 TRACE_TONE_DBFS = -24.0
 RUNS = RUNS_OPTICAL
 
@@ -751,7 +774,7 @@ def main():
     ap.add_argument("--target", choices=sorted(TARGETS), default="optical")
     ap.add_argument("--runs",
                     choices=("default", "device", "fix", "steps", "trace",
-                             "check", "balance"),
+                             "check", "balance", "floor"),
                     default="default",
                     help="device: only the driver-silent comparison")
     ap.add_argument("--repeats", type=int, default=2,
@@ -805,10 +828,11 @@ def main():
         print("\nOn the Babyface, press OUT until %s is selected "
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
-        if args.runs in ("trace", "check", "balance"):
+        if args.runs in ("trace", "check", "balance", "floor"):
             run_trace(card, dev, target, args.seconds, outdir, args.repeats,
                       check=args.runs == "check",
-                      balance=args.runs == "balance")
+                      balance=args.runs == "balance",
+                      floor=args.runs == "floor")
             runs = []
         elif args.runs == "steps":
             run_steps(card, dev, target, args.seconds, outdir,
