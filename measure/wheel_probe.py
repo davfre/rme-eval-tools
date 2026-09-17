@@ -165,8 +165,9 @@ def tone_second():
     return bytes(out)
 
 
-def run(card, dev, seconds, path):
-    """Play the tone and record `seconds` of all capture channels."""
+def run(card, dev, seconds, path, go=None):
+    """Play the tone and record `seconds` of all capture channels.
+    `go` is called 1.5 s into the recording, after the start level."""
     play = subprocess.Popen(["aplay", "-q", "-D", dev, "-t", "raw",
                              "-f", "S32_LE", "-c", str(CH), "-r", str(RATE)],
                             stdin=subprocess.PIPE)
@@ -183,9 +184,14 @@ def run(card, dev, seconds, path):
     t = threading.Thread(target=feed, daemon=True)
     t.start()
     time.sleep(0.8)
-    subprocess.run(["arecord", "-q", "-D", dev, "-t", "raw", "-f", "S32_LE",
-                    "-c", str(CH), "-r", str(RATE), "-d", str(seconds), path],
-                   check=True)
+    rec = subprocess.Popen(["arecord", "-q", "-D", dev, "-t", "raw",
+                            "-f", "S32_LE", "-c", str(CH), "-r", str(RATE),
+                            "-d", str(seconds), path])
+    if go:
+        time.sleep(1.5)
+        go()
+    if rec.wait():
+        raise subprocess.CalledProcessError(rec.returncode, "arecord")
     stop.set()
     play.terminate()
     play.wait()
@@ -281,10 +287,20 @@ def analyse(x):
     }
 
 
-def kmsg_lines():
+def kmsg_mark(tag):
+    subprocess.run(["sudo", "tee", "/dev/kmsg"], input="wheel_probe %s\n" % tag,
+                   text=True, stdout=subprocess.DEVNULL, check=True)
+
+
+def kmsg_since(tag):
+    """Kernel log lines after our marker (the ring buffer rotates, so
+    line counts are not usable)."""
     out = subprocess.run(["sudo", "dmesg"], capture_output=True, text=True,
-                         check=True).stdout
-    return out.splitlines()
+                         check=True).stdout.splitlines()
+    for i in range(len(out) - 1, -1, -1):
+        if "wheel_probe %s" % tag in out[i]:
+            return out[i + 1:]
+    return []
 
 
 def wheel_counts(lines):
@@ -319,9 +335,8 @@ def wheel_counts(lines):
 
 
 def settled_db(x, first):
-    """Tone level over the first or last 300 ms of the recording."""
-    n = int(0.3 * RATE)
-    seg = x[RATE // 3:RATE // 3 + n] if first else x[-n:]
+    """Tone level before GO (0.5-1.3 s) or over the last 300 ms."""
+    seg = x[RATE // 2:int(1.3 * RATE)] if first else x[-int(0.3 * RATE):]
     c = math.cos(2 * math.pi * FREQ / RATE)
     s0 = s1 = 0.0
     for v in seg:
@@ -331,44 +346,61 @@ def settled_db(x, first):
     return 20 * math.log10(amp) if amp > 0 else -180.0
 
 
-def run_steps(card, dev, target, seconds, outdir):
+def force_master(card, out, value):
+    """Set the master even when the driver's cache already holds it (the
+    driver skips a write of an unchanged value)."""
+    name = OUTPUTS[out] + " Playback Volume"
+    card.cset(name, "%d,%d" % (value + 1, value + 1), index=out)
+    card.cset(name, "%d,%d" % (value, value), index=out)
+
+
+def run_steps(card, dev, target, seconds, outdir, repeats):
     set_mode(5)
     subprocess.run(["sudo", "tee", PANEL_DEBUG], input="1", text=True,
                    stdout=subprocess.DEVNULL, check=True)
+    runs = [k for _ in range(repeats) for k in STEP_KINDS]
     rows = []
     try:
-        for label, start, what in STEP_RUNS:
+        for n, (label, start, what) in enumerate(runs):
             out = target["out"]
-            card.cset(OUTPUTS[out] + " Playback Volume",
-                      "%d,%d" % (start, start), index=out)
-            print("\n-- %s\n   %s" % (label, what))
-            input("   Press Enter, then start within a second "
-                  "(%d s recording). " % seconds)
-            before = len(kmsg_lines())
-            raw = os.path.join(outdir, "steps-%d.raw" % len(rows))
-            run(card, dev, seconds, raw)
-            up, down, polls = wheel_counts(kmsg_lines()[before:])
+            force_master(card, out, start)
+            time.sleep(0.3)
+            print("\n-- %d/%d %s: %s, then stop." % (n + 1, len(runs),
+                                                  label, what))
+            input("   Press Enter, hands off, and wait for GO. ")
+            tag = "run%d-%d" % (os.getpid(), n)
+            kmsg_mark(tag)
+            raw = os.path.join(outdir, "steps-%d.raw" % n)
+            run(card, dev, seconds, raw,
+                go=lambda: print("   >>> GO <<<", flush=True))
+            up, down, polls = wheel_counts(kmsg_since(tag))
             x = max(load(raw, target["rec"]),
                     key=lambda ch: max(abs(v) for v in ch))
             os.remove(raw)
             db0, db1 = settled_db(x, True), settled_db(x, False)
             net = up - down
-            per = (db1 - db0) / net if net else float("nan")
+            per = abs(db1 - db0) / abs(net) if net else float("nan")
             clip = max(abs(v) for v in x) > 0.95
-            print("   counts +%d -%d (per poll: %s)" %
-                  (up, down, " ".join("%+d" % d for d in polls[:40])))
+            print("   counts %+d (polls: %s)" %
+                  (net, " ".join("%+d" % d for d in polls[:40])))
             print("   level %.1f -> %.1f dB: %+.1f dB, %.2f dB per count%s" %
                   (db0, db1, db1 - db0, per,
                    "  (CLIPPED, ignore)" if clip else ""))
-            rows.append((label, net, db1 - db0, per, max(map(abs, polls),
-                                                         default=0)))
+            rows.append((label, net, db1 - db0, per,
+                         max(map(abs, polls), default=0), clip))
     finally:
         subprocess.run(["sudo", "tee", PANEL_DEBUG], input="0", text=True,
                        stdout=subprocess.DEVNULL)
     print("\n== step size per count")
-    for label, net, ddb, per, big in rows:
-        print("  %-14s counts %+3d  level %+6.1f dB  %.2f dB/count  "
-              "largest count per poll %d" % (label, net, ddb, per, big))
+    for label, net, ddb, per, big, clip in rows:
+        print("  %-11s counts %+3d  level %+6.1f dB  %.2f dB/count  "
+              "max per poll %d%s" % (label, net, ddb, per, big,
+                                     "  CLIPPED" if clip else ""))
+    for kind, _, _ in STEP_KINDS:
+        vals = [r[3] for r in rows if r[0] == kind and r[1] and not r[5]]
+        if vals:
+            print("  %-11s mean %.2f dB/count over %d runs"
+                  % (kind, sum(vals) / len(vals), len(vals)))
 
 
 def median(vals):
@@ -446,17 +478,17 @@ RUNS_FIX = [
 # How far the device moves per wheel count, slow and fast.  Driver
 # silent (mode 5); the panel log gives the counts, the recording the dB.
 # (label, start master, instruction)
-STEP_RUNS = [
-    ("slow, up", 0x0103,
-     "Turn CLOCKWISE slowly, one click at a time, about 12 clicks. Then stop."),
-    ("fast, up", 0x0103,
-     "Spin CLOCKWISE quickly, about 12 clicks in one flick. Then stop."),
-    ("slow, down", 0x1000,
-     "Turn ANTICLOCKWISE slowly, one click at a time, about 12 clicks. Then stop."),
-    ("fast, down", 0x1000,
-     "Spin ANTICLOCKWISE quickly, about 12 clicks in one flick. Then stop."),
-    ("very fast, up", 0x0103,
-     "Spin CLOCKWISE as fast as you can, a short flick. Then stop."),
+STEP_UP_START = 0x0103       # -30 dB: room to go up without clipping IN3
+STEP_DOWN_START = 0x1000     # -6 dB: room to go down
+STEP_KINDS = [
+    ("slow, up", STEP_UP_START,
+     "turn CLOCKWISE slowly, one click at a time, about 10 clicks"),
+    ("fast, up", STEP_UP_START,
+     "spin CLOCKWISE quickly, about 10 clicks in one flick"),
+    ("slow, down", STEP_DOWN_START,
+     "turn ANTICLOCKWISE slowly, one click at a time, about 10 clicks"),
+    ("fast, down", STEP_DOWN_START,
+     "spin ANTICLOCKWISE quickly, about 10 clicks in one flick"),
 ]
 PANEL_DEBUG = "/sys/module/snd_usb_babyface_pro/parameters/panel_debug"
 RUNS = RUNS_OPTICAL
@@ -468,6 +500,8 @@ def main():
     ap.add_argument("--runs", choices=("default", "device", "fix", "steps"),
                     default="default",
                     help="device: only the driver-silent comparison")
+    ap.add_argument("--repeats", type=int, default=2,
+                    help="steps: how many times to repeat the set")
     ap.add_argument("--card", default="BabyfacePro")
     ap.add_argument("--out", default=None, help="keep recordings here")
     ap.add_argument("--seconds", type=int, default=12)
@@ -518,7 +552,8 @@ def main():
               "(the wheel must control that output)." % target["panel"])
         input("Press Enter when done. ")
         if args.runs == "steps":
-            run_steps(card, dev, target, args.seconds, outdir)
+            run_steps(card, dev, target, args.seconds, outdir,
+                      args.repeats)
             runs = []
         for label, mode, what in runs:
             set_mode(mode)
