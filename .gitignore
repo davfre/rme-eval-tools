@@ -1,3 +1,9 @@
 measure/ratecheck
 measure/ratesteal
 measure/ratesweep
+__pycache__/
+/state/
+/ratecheck
+/ratesteal
+/ratesweep
+measure/wheelmute-before.state
