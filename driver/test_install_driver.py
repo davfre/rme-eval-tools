@@ -43,4 +43,20 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): m.check_source(p,{Path('dkms.conf'):b'expected'})
             self.assertEqual((p/'dkms.conf').read_bytes(),b'wrong')
 
+    def test_resolve_ref(self):
+        import subprocess,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);git=lambda *a:subprocess.run(['git','-C',d,*a],check=True,capture_output=True,text=True).stdout.strip()
+            git('init','-q','-b','main');(p/'tools/kernel').mkdir(parents=True);(p/'tools/kernel/a.c').write_text('1')
+            git('add','.');git('-c','user.name=t','-c','user.email=t@t','commit','-qm','one');first=git('rev-parse','HEAD')
+            git('branch','other');(p/'tools/kernel/a.c').write_text('2')
+            git('-c','user.name=t','-c','user.email=t@t','commit','-qam','two')
+            (p/'tools/kernel/a.c').write_text('dirty')
+            with patch.object(m,'REPO',p):
+                self.assertEqual(m.resolve('other'),(first,'other'))  # a dirty checkout does not matter for a ref
+                with self.assertRaises(RuntimeError): m.resolve('HEAD')
+                with self.assertRaises(RuntimeError): m.resolve('nope')
+                git('checkout','-q','--','tools/kernel')
+                self.assertEqual(m.resolve('HEAD'),(git('rev-parse','HEAD'),'main'))
+
 if __name__=='__main__':unittest.main()

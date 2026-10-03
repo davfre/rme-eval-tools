@@ -125,6 +125,7 @@ def install_kernels(version, kernels, records, verify_fn=verify):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', action='store_true', help='show the proposed steps without changing anything')
+    parser.add_argument('--ref', default='HEAD', help='commit or branch to install (default: the checkout\'s HEAD)')
     args = parser.parse_args()
     for tool in ('git', 'dkms', 'modinfo', 'sudo'):
         if not shutil.which(tool):
@@ -140,12 +141,23 @@ def main():
         execute(args)
 
 
-def execute(args):
+def resolve(ref):
+    """Return the commit to install and a label for it."""
+    try:
+        commit = run('git', '-C', REPO, 'rev-parse', '--verify', '--quiet', ref + '^{commit}', capture=True)
+    except subprocess.CalledProcessError:
+        raise RuntimeError(f'Not a commit in {REPO}: {ref}')
+    if ref != 'HEAD':
+        return commit, ref
+    # Only the checkout can be mistaken for what gets installed.
     if run('git', '-C', REPO, 'status', '--porcelain', '--', 'tools/kernel', capture=True):
         raise RuntimeError('Commit or set aside changes in tools/kernel before installing a snapshot.')
-    commit = run('git', '-C', REPO, 'rev-parse', 'HEAD', capture=True)
+    return commit, run('git', '-C', REPO, 'branch', '--show-current', capture=True) or '(detached HEAD)'
+
+
+def execute(args):
+    commit, branch = resolve(args.ref)
     version = '0.1.0.local.' + commit[:12]
-    branch = run('git', '-C', REPO, 'branch', '--show-current', capture=True) or '(detached HEAD)'
     kernels = [target_kernel()]
     missing = [k for k in kernels if not (Path('/usr/lib/modules') / k / 'build/Makefile').is_file()]
     if missing:
