@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 rme_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-module="$rme_dir/babyface-pro-linux/tools/kernel/snd-usb-babyface-pro.ko"
+# BF_MODULE loads another build, for example from a worktree.
+module="${BF_MODULE:-$rme_dir/babyface-pro-linux/tools/kernel/snd-usb-babyface-pro.ko}"
 [[ -f "$module" ]] || { echo 'Build the driver first with just driver-build.' >&2; exit 1; }
 read -r built_kernel _ <<< "$(modinfo -F vermagic "$module")"
 [[ "$built_kernel" == "$(uname -r)" ]] || { echo 'Module does not match running kernel.' >&2; exit 1; }
@@ -42,7 +43,10 @@ if [[ -d /sys/module/snd_usb_babyface_pro ]]; then
     mute
     sudo rmmod snd_usb_babyface_pro
 fi
-sudo insmod "$module" frames_per_urb=32 nurbs=8
+# BF_PARAMS sets module parameters; unset, the driver's defaults apply.
+# The old 32-frame profile: BF_PARAMS='frames_per_urb=32 nurbs=8'.
+# shellcheck disable=SC2086
+sudo insmod "$module" ${BF_PARAMS-}
 sudo udevadm settle
 mute
 [[ $(cat /sys/module/snd_usb_babyface_pro/srcversion) == "$expected" ]]
