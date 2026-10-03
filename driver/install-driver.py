@@ -13,8 +13,10 @@ import tempfile
 MODULE = 'snd-usb-babyface-pro'
 ROOT = Path(__file__).resolve().parents[2]
 REPO = ROOT / 'babyface-pro-linux'
+# Earlier installs forced the 32-frame URB profile here.  Since the driver
+# sizes its URBs from the period, boot uses the driver's own defaults, so an
+# existing file is backed up and removed.
 OPTIONS = Path('/etc/modprobe.d/snd-usb-babyface-pro-local.conf')
-OPTION_TEXT = f'options {MODULE} frames_per_urb=32 nurbs=8\n'
 POLICY = Path('/etc/dkms') / f'{MODULE}.conf'
 KERNEL_PATTERN = r'^[0-9].*-cachyos$'
 POLICY_TEXT = '# Local Babyface policy: regular CachyOS only, never LTS.\nBUILD_EXCLUSIVE_KERNEL="' + KERNEL_PATTERN + '"\n'
@@ -186,8 +188,7 @@ def execute(args):
         print(f'  {kernel}: {status}; {action}')
     for old in old_versions:
         print(f'  Replace {old} only after all new builds succeed; remove its registration after verification.')
-    options_match = OPTIONS.exists() and OPTIONS.read_text() == OPTION_TEXT
-    print('  Boot options: ' + ('32/8 already configured' if options_match else f'write 32/8 to {OPTIONS}'))
+    print('  Boot options: ' + (f'back up and remove {OPTIONS}; the driver defaults apply' if OPTIONS.exists() else 'driver defaults'))
     print('\nSource snapshots are retained for rollback. This does not reload the driver or restart audio.')
     print('Only the running kernel is targeted. LTS is excluded from automatic DKMS builds too.')
     print('  DKMS policy: ' + str(POLICY))
@@ -215,14 +216,11 @@ def execute(args):
         # Do not leave competing versions registered for future autoinstall.
         for old in old_versions:
             dkms('remove', '-m', MODULE, '-v', old, '--all')
-        if not options_match:
-            if OPTIONS.exists():
-                backup = OPTIONS.with_name(OPTIONS.name + '.before-' + version)
-                if not backup.exists():
-                    run('sudo', 'cp', '-a', OPTIONS, backup)
-            config = stage / 'options.conf'
-            config.write_text(OPTION_TEXT)
-            run('sudo', 'install', '-Dm644', config, OPTIONS)
+        if OPTIONS.exists():
+            backup = OPTIONS.with_name(OPTIONS.name + '.before-' + version)
+            if not backup.exists():
+                run('sudo', 'cp', '-a', OPTIONS, backup)
+            run('sudo', 'rm', OPTIONS)
         for kernel in kernels:
             run('sudo', 'depmod', '-a', kernel)
     print('\nInstalled and verified for: ' + ', '.join(kernels))
